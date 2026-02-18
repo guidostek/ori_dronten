@@ -17,7 +17,7 @@ DRONTEN_API_V2 = "https://gemeenteraad.dronten.nl/api/v2"
 STATE_FILE = "seen_meetings_firebase.json"
 LOG_FILE = "firebase_meetings.log"
 
-# TEST_MODE: True = Forceer een update van de eerste meeting in het venster
+# TEST_MODE: True = Forceer update van 1e meeting in venster
 TEST_MODE = False
 
 # --- FIREBASE SETUP ---
@@ -88,32 +88,45 @@ def run_monitor():
     else: state = {}
     
     now = datetime.now()
-    # Bereken datums voor het Python filter
     dt_from = now - timedelta(days=14)
     dt_to = now + timedelta(days=30)
     
-    # Gebruik de URL structuur die werkt: sort op id_desc en pak een ruime limit
-    url = f"{DRONTEN_API_V2}/meetings/?sort=id_desc&date_from={dt_from.strftime('%Y-%m-%d')}&limit=100"
+    # URL Correctie: geen trailing slash voor 'meetings', sort=id_desc
+    date_str = dt_from.strftime('%Y-%m-%d')
+    url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&date_from={date_str}&limit=100"
     
     try:
+        logging.info(f"Aanroepen API: {url}")
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-        if resp.status_code != 200: return
+        if resp.status_code != 200:
+            logging.error(f"API Fout: {resp.status_code}")
+            return
         
         data = resp.json()
-        items = data.get('items') or data.get('result', {}).get('items', [])
+        items = []
+
+        # Robuuste check op resultaat-key (voor v2 is dit vaak 'meetings' of 'items' binnen 'result')
+        res = data.get('result', {})
+        if isinstance(res, dict):
+            items = res.get('meetings') or res.get('items') or res.get('documents') or []
         
+        if not items and 'items' in data: items = data['items']
+        if not items and 'meetings' in data: items = data['meetings']
+        
+        logging.info(f"Aantal items gevonden in API: {len(items)}")
+
         has_changes = False
         for meta in items:
             m_id = str(meta['id'])
             m_date_str = meta.get('date', '')
             if not m_date_str: continue
             
-            # Python check: valt de datum binnen ons 6-weken venster?
+            # Filter op venster
             m_date = datetime.strptime(m_date_str[:10], '%Y-%m-%d')
             if not (dt_from <= m_date <= dt_to):
                 continue
 
-            # Als hij in het venster valt, haal de details op
+            # Haal details op via v1
             detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
             d_resp = requests.get(detail_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
             if d_resp.status_code != 200: continue

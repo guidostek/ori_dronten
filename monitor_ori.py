@@ -76,14 +76,21 @@ def run_monitor():
     dt_from = now - timedelta(days=14)
     dt_to = now + timedelta(days=30)
     
-    # Gebruik de URL die werkt
-    url = f"{DRONTEN_API_V2}/meetings/?sort=id_desc&date_from={dt_from.strftime('%Y-%m-%d')}&limit=100"
+    date_str = dt_from.strftime('%Y-%m-%d')
+    url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&date_from={date_str}&limit=100"
     
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
         if resp.status_code != 200: return
         data = resp.json()
-        items = data.get('items') or data.get('result', {}).get('items', [])
+        
+        # Robuuste check op resultaat-key
+        res = data.get('result', {})
+        items = []
+        if isinstance(res, dict):
+            items = res.get('meetings') or res.get('items') or []
+        if not items and 'items' in data: items = data['items']
+        if not items and 'meetings' in data: items = data['meetings']
         
         found_new = False
         for meta in items:
@@ -91,7 +98,6 @@ def run_monitor():
             if not m_date_str: continue
             m_date = datetime.strptime(m_date_str[:10], '%Y-%m-%d')
             
-            # Alleen verwerken als het binnen het venster valt
             if not (dt_from <= m_date <= dt_to): continue
 
             detail_url = f"{DRONTEN_API_V1}/meetings/{meta['id']}"
