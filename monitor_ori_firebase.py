@@ -3,9 +3,8 @@ import json
 import logging
 import os
 import sys
-import re
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, messaging
 from urllib.parse import quote
 from datetime import datetime, timedelta
 
@@ -14,11 +13,10 @@ CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
 DRONTEN_API_V1 = "https://gemeenteraad.dronten.nl/api/v1"
 DRONTEN_API_V2 = "https://gemeenteraad.dronten.nl/api/v2"
 
-STATE_FILE = "seen_meetings_firebase.json"
-LOG_FILE = "firebase_meetings.log"
-
-# TEST_MODE: True = Forceer update van 1e meeting in venster
-TEST_MODE = False
+# Bestanden voor de "geheugensteuntjes" op de Pi
+STATE_FILE = "/home/guido/oriscript/seen_meetings_firebase.json"
+NOTIFIED_FILE = "/home/guido/oriscript/notified_meetings.json"
+LOG_FILE = "/home/guido/oriscript/firebase_meetings.log"
 
 # --- FIREBASE SETUP ---
 if not firebase_admin._apps:
@@ -31,121 +29,174 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s -
 console = logging.StreamHandler(sys.stdout)
 logging.getLogger().addHandler(console)
 
-# --- FIREBASE LOGICA ---
+def load_json_file(path):
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-def push_meeting_to_firebase(meeting_data):
+def save_json_file(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f)
+
+def send_push_notification(title, body):
     try:
-        meeting_id = str(meeting_data['id'])
-        base_url = meeting_data.get('fullUrl', '')
-        full_agenda_url = f"https://gemeenteraad.dronten.nl{base_url}" if base_url.startswith('/') else base_url
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            topic='raad_updates',
+        )
+        response = messaging.send(message)
+        logging.info(f"Push notificatie verzonden: {response}")
+    except Exception as e:
+        logging.error(f"Fout bij verzenden push: {e}")
 
-        items_list = []
-        raw_items = meeting_data.get('items') or meeting_data.get('agenda_items', [])
-        total_docs_count = 0
+def push_meeting_to_firebase(meta_data, full_data=None):
+    try:
+        meeting_id = str(meta_data['id'])
+        
+        # 1. Bepaal metadata (Defensief)
+        dmu_name = 'Vergadering'
+        if meta_data.get('dmu'):
+            dmu_name = meta_data['dmu'].get('name', 'Vergadering')
+            
+        label_val = None
+        if meta_data.get('meetingLabel'):
+            label_val = meta_data['meetingLabel'].get('value')
+            
+        display_type = f"{dmu_name} - {label_val}" if label_val else dmu_name
+        meeting_date = meta_data.get('date')
 
-        for item in raw_items:
-            docs = []
-            for d in item.get('documents', []):
-                doc_id = str(d['id'])
-                dl_link = f"{DRONTEN_API_V2}/documents/{doc_id}/download"
-                docs.append({
-                    'id': doc_id,
-                    'filename': d.get('filename', 'Naamloos'),
-                    'url': dl_link,
-                    'viewer_url': f"https://docs.google.com/viewer?url={quote(dl_link)}&embedded=true"
+        # 2. Check bestaande status in DB om de 'grijze bug' te voorkomen
+        doc_ref = db.collection('vergaderingen').document(meeting_id)
+        existing_doc = doc_ref.get()
+        
+        # Basis payload
+        meeting_payload = {
+            'id': meeting_id,
+            'type': display_type,
+            'date': meeting_date,
+            'location': meta_data.get('location', 'Onbekend'),
+            'last_updated': firestore.SERVER_TIMESTAMP,
+        }
+
+        # Als synced nog niet bestaat in de payload, bepalen we het hier
+        if existing_doc.exists:
+            # Als hij al in de DB stond maar geen 'synced' veld had -> True (legacy data)
+            current_db_data = existing_doc.to_dict()
+            meeting_payload['synced'] = current_db_data.get('synced', True)
+        else:
+            meeting_payload['synced'] = False
+
+        # 3. Indien volledige sync (full_data is meegegeven)
+        if full_data:
+            items_list = []
+            total_docs = 0
+            raw_items = full_data.get('items') or full_data.get('agenda_items', []) or []
+            
+            for item in raw_items:
+                if not item: continue
+                docs = []
+                for d in (item.get('documents') or []):
+                    if not d: continue
+                    d_id = str(d.get('id', ''))
+                    dl_link = f"{DRONTEN_API_V2}/documents/{d_id}/download"
+                    docs.append({
+                        'id': d_id,
+                        'filename': d.get('filename', 'Naamloos'),
+                        'url': dl_link,
+                        'viewer_url': f"https://docs.google.com/viewer?url={quote(dl_link)}&embedded=true"
+                    })
+                    total_docs += 1
+                
+                items_list.append({
+                    'number': str(item.get('number', '')),
+                    'title': item.get('title', 'Agendapunt'),
+                    'description': item.get('description', ''),
+                    'documents': docs
                 })
-                total_docs_count += 1
-            items_list.append({
-                'number': str(item.get('number', '')),
-                'title': item.get('title', 'Agendapunt'),
-                'description': item.get('description', ''),
-                'documents': docs
+            
+            meeting_payload.update({
+                'items': items_list,
+                'doc_count': total_docs,
+                'synced': True
             })
 
-        doc_ref = db.collection('vergaderingen').document(meeting_id)
-        doc_ref.set({
-            'id': meeting_id,
-            'type': meeting_data.get('classification') or meeting_data.get('type') or 'Vergadering',
-            'date': meeting_data.get('date'), 
-            'location': meeting_data.get('location', 'Onbekend'),
-            'url': full_agenda_url,
-            'items': items_list,
-            'doc_count': total_docs_count,
-            'last_updated': firestore.SERVER_TIMESTAMP
-        }, merge=True)
-        logging.info(f"Meeting {meeting_id} gesynced naar Firebase.")
-        return total_docs_count
+        doc_ref.set(meeting_payload, merge=True)
+        return display_type, meeting_date
     except Exception as e:
-        logging.error(f"Fout bij Firebase upload {meeting_data.get('id')}: {e}")
-        return 0
-
-# --- MONITOR LOGICA ---
+        logging.error(f"Fout in push_meeting_to_firebase voor {meta_data.get('id')}: {e}")
+        return None, None
 
 def run_monitor():
-    logging.info("--- Start Firebase Meeting Sync (Venster 6 weken) ---")
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f: state = json.load(f)
-    else: state = {}
+    logging.info("--- Start Firebase Meeting Monitor (Gecorrigeerd) ---")
     
+    # Geheugen laden
+    seen_state = load_json_file(STATE_FILE) # Bewaart doc_counts
+    notified_ids = set(load_json_file(NOTIFIED_FILE)) # Bewaart welke IDs al gepusht zijn
+
+    # Vensters bepalen
     now = datetime.now()
-    dt_from = now - timedelta(days=14)
-    dt_to = now + timedelta(days=30)
+    # We kijken 60 dagen terug om historie voor Raad/Oordeelsvorming te garanderen
+    start_date_str = (now - timedelta(days=60)).strftime('%Y-%m-%d')
     
-    # URL Correctie: geen trailing slash voor 'meetings', sort=id_desc
-    date_str = dt_from.strftime('%Y-%m-%d')
-    url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&date_from={date_str}&limit=100"
+    # We syncen documenten volledig voor alles tussen 2 weken geleden en 6 weken vooruit
+    sync_start = now - timedelta(days=14)
+    sync_end = now + timedelta(days=42)
+
+    url = f"{DRONTEN_API_V2}/meetings?sort=date_asc&date_from={start_date_str}&limit=100"
     
     try:
-        logging.info(f"Aanroepen API: {url}")
-        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-        if resp.status_code != 200:
-            logging.error(f"API Fout: {resp.status_code}")
-            return
-        
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
         data = resp.json()
-        items = []
-
-        # Robuuste check op resultaat-key (voor v2 is dit vaak 'meetings' of 'items' binnen 'result')
-        res = data.get('result', {})
-        if isinstance(res, dict):
-            items = res.get('meetings') or res.get('items') or res.get('documents') or []
+        items = data.get('result', {}).get('meetings') or data.get('items') or []
         
-        if not items and 'items' in data: items = data['items']
-        if not items and 'meetings' in data: items = data['meetings']
-        
-        logging.info(f"Aantal items gevonden in API: {len(items)}")
+        has_new_notif = False
+        state_changed = False
 
-        has_changes = False
         for meta in items:
             m_id = str(meta['id'])
-            m_date_str = meta.get('date', '')
-            if not m_date_str: continue
+            m_date_raw = meta.get('date', '')
+            if not m_date_raw: continue
             
-            # Filter op venster
-            m_date = datetime.strptime(m_date_str[:10], '%Y-%m-%d')
-            if not (dt_from <= m_date <= dt_to):
-                continue
+            m_date_dt = datetime.strptime(m_date_raw[:10], '%Y-%m-%d')
+            
+            full_data = None
+            # Bepaal of we voor deze vergadering de volledige details (documenten) ophalen
+            if sync_start <= m_date_dt <= sync_end:
+                detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
+                d_resp = requests.get(detail_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
+                if d_resp.status_code == 200:
+                    full_data = d_resp.json()
 
-            # Haal details op via v1
-            detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
-            d_resp = requests.get(detail_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-            if d_resp.status_code != 200: continue
-            
-            full_data = d_resp.json()
-            raw_items = full_data.get('items') or full_data.get('agenda_items', [])
-            current_doc_count = sum(len(i.get('documents', [])) for i in raw_items)
-            
-            if state.get(m_id) != current_doc_count or TEST_MODE:
-                push_meeting_to_firebase(full_data)
-                state[m_id] = current_doc_count
-                has_changes = True
-                if TEST_MODE: break
+            # Naar Firebase sturen
+            display_type, m_date = push_meeting_to_firebase(meta, full_data)
 
-        if has_changes:
-            with open(STATE_FILE, 'w') as f: json.dump(state, f)
-            
+            # --- NOTIFICATIE LOGICA ---
+            if full_data and m_id not in notified_ids:
+                total_docs = sum(len(i.get('documents', [])) for i in (full_data.get('items') or []))
+                
+                # Alleen notificeren als er daadwerkelijk documenten zijn
+                if total_docs > 0:
+                    titel_notif = f"Nieuwe agenda: {display_type}"
+                    body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
+                    send_push_notification(titel_notif, body_notif)
+                    
+                    notified_ids.add(m_id)
+                    has_new_notif = True
+
+        # Geheugen opslaan
+        if has_new_notif:
+            save_json_file(NOTIFIED_FILE, list(notified_ids))
+            logging.info("Notificatie geheugen bijgewerkt.")
+
     except Exception as e:
-        logging.error(f"Fout bij sync: {e}")
+        logging.error(f"Fout tijdens run_monitor: {e}")
 
 if __name__ == "__main__":
     run_monitor()
