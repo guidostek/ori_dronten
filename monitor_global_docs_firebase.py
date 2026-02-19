@@ -1,11 +1,8 @@
 import requests
 import json
-import logging
 import os
-import sys
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
-from urllib.parse import quote
 
 # --- CONFIGURATIE ---
 CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
@@ -20,15 +17,12 @@ db = firestore.client()
 def load_notified_docs():
     if os.path.exists(NOTIFIED_DOCS_FILE):
         try:
-            with open(NOTIFIED_DOCS_FILE, 'r') as f:
-                return set(json.load(f))
-        except:
-            return set()
+            with open(NOTIFIED_DOCS_FILE, 'r') as f: return set(json.load(f))
+        except: return set()
     return set()
 
 def save_notified_docs(notified_set):
-    with open(NOTIFIED_DOCS_FILE, 'w') as f:
-        json.dump(list(notified_set), f)
+    with open(NOTIFIED_DOCS_FILE, 'w') as f: json.dump(list(notified_set), f)
 
 def send_push_notification(title, body):
     try:
@@ -44,8 +38,8 @@ def run_monitor():
     notified_docs = load_notified_docs()
     new_notifications = False
     
-    # Haal recente stukken op
-    url = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=20"
+    # Haal recente stukken op (we pakken er 50 om ook herstel te bieden)
+    url = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50"
     resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
     if resp.status_code != 200: return
     
@@ -53,7 +47,10 @@ def run_monitor():
     
     for doc in docs:
         doc_id = str(doc['id'])
-        title = doc.get('filename', 'Naamloos stuk')
+        
+        # Verbeterde naamgeving logica:
+        # We proberen description, dan filename, dan original_filename
+        title = doc.get('description') or doc.get('filename') or doc.get('original_filename') or f"Document {doc_id}"
         
         # 1. Sync naar Firestore
         doc_ref = db.collection('raadstukken').document(doc_id)
@@ -64,7 +61,7 @@ def run_monitor():
             'timestamp': firestore.SERVER_TIMESTAMP
         }, merge=True)
         
-        # 2. Check notificatie-geheugen
+        # 2. Notificatie check
         if doc_id not in notified_docs:
             send_push_notification("Nieuw raadsstuk", title)
             notified_docs.add(doc_id)
@@ -72,6 +69,7 @@ def run_monitor():
             
     if new_notifications:
         save_notified_docs(notified_docs)
+    print(f"Monitor voltooid. {len(docs)} stukken gecontroleerd/bijgewerkt.")
 
 if __name__ == "__main__":
     run_monitor()
