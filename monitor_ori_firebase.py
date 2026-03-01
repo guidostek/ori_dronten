@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import requests
 import json
 import logging
@@ -13,18 +14,15 @@ CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
 DRONTEN_API_V1 = "https://gemeenteraad.dronten.nl/api/v1"
 DRONTEN_API_V2 = "https://gemeenteraad.dronten.nl/api/v2"
 
-# Bestanden voor de "geheugensteuntjes" op de Pi
 STATE_FILE = "/home/guido/oriscript/seen_meetings_firebase.json"
 NOTIFIED_FILE = "/home/guido/oriscript/notified_meetings.json"
 LOG_FILE = "/home/guido/oriscript/firebase_meetings.log"
 
-# --- FIREBASE SETUP ---
 if not firebase_admin._apps:
     cred = credentials.Certificate(CRED_PATH)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- LOGGING ---
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(message)s')
 console = logging.StreamHandler(sys.stdout)
 logging.getLogger().addHandler(console)
@@ -60,7 +58,6 @@ def push_meeting_to_firebase(meta_data, full_data=None):
     try:
         meeting_id = str(meta_data['id'])
         
-        # 1. Bepaal metadata (Defensief)
         dmu_name = 'Vergadering'
         if meta_data.get('dmu'):
             dmu_name = meta_data['dmu'].get('name', 'Vergadering')
@@ -72,31 +69,26 @@ def push_meeting_to_firebase(meta_data, full_data=None):
         display_type = f"{dmu_name} - {label_val}" if label_val else dmu_name
         meeting_date = meta_data.get('date')
         
-        # DE FIX: Haal de tijd op uit de vernieuwde API structuur
         meeting_time = meta_data.get('startTime') or meta_data.get('time') or ''
 
-        # 2. Check bestaande status in DB om de 'grijze bug' te voorkomen
         doc_ref = db.collection('vergaderingen').document(meeting_id)
         existing_doc = doc_ref.get()
         
-        # Basis payload (Nu MÉT startTime)
         meeting_payload = {
             'id': meeting_id,
             'type': display_type,
             'date': meeting_date,
-            'startTime': meeting_time, # Toegevoegd zodat Flutter dit kan uitlezen!
+            'startTime': meeting_time, 
             'location': meta_data.get('location', 'Onbekend'),
             'last_updated': firestore.SERVER_TIMESTAMP,
         }
 
-        # Als synced nog niet bestaat in de payload, bepalen we het hier
         if existing_doc.exists:
             current_db_data = existing_doc.to_dict()
             meeting_payload['synced'] = current_db_data.get('synced', True)
         else:
             meeting_payload['synced'] = False
 
-        # 3. Indien volledige sync (full_data is meegegeven)
         if full_data:
             items_list = []
             total_docs = 0
@@ -108,6 +100,7 @@ def push_meeting_to_firebase(meta_data, full_data=None):
                 for d in (item.get('documents') or []):
                     if not d: continue
                     d_id = str(d.get('id', ''))
+                    if not d_id: continue
                     dl_link = f"{DRONTEN_API_V2}/documents/{d_id}/download"
                     docs.append({
                         'id': d_id,
@@ -117,10 +110,13 @@ def push_meeting_to_firebase(meta_data, full_data=None):
                     })
                     total_docs += 1
                 
+                # FIX: Haal toelichting uit ALLE mogelijke API velden
+                raw_desc = item.get('explanation') or item.get('description') or item.get('text') or ''
+                
                 items_list.append({
                     'number': str(item.get('number', '')),
                     'title': item.get('title', 'Agendapunt'),
-                    'description': item.get('description', ''), # Neemt HTML tekst netjes mee voor Flutter
+                    'description': str(raw_desc).strip(), 
                     'documents': docs
                 })
             
@@ -137,13 +133,11 @@ def push_meeting_to_firebase(meta_data, full_data=None):
         return None, None
 
 def run_monitor():
-    logging.info("--- Start Firebase Meeting Monitor (Met StartTime Fix) ---")
+    logging.info("--- Start Firebase Meeting Monitor ---")
     
-    # Geheugen laden
     seen_state = load_json_file(STATE_FILE) 
     notified_ids = set(load_json_file(NOTIFIED_FILE)) 
 
-    # Vensters bepalen
     now = datetime.now()
     start_date_str = (now - timedelta(days=60)).strftime('%Y-%m-%d')
     
@@ -158,7 +152,6 @@ def run_monitor():
         items = data.get('result', {}).get('meetings') or data.get('items') or []
         
         has_new_notif = False
-        state_changed = False
 
         for meta in items:
             m_id = str(meta['id'])
@@ -174,10 +167,8 @@ def run_monitor():
                 if d_resp.status_code == 200:
                     full_data = d_resp.json()
 
-            # Naar Firebase sturen
             display_type, m_date = push_meeting_to_firebase(meta, full_data)
 
-            # --- NOTIFICATIE LOGICA ---
             if full_data and m_id not in notified_ids:
                 total_docs = sum(len(i.get('documents', [])) for i in (full_data.get('items') or []))
                 
@@ -189,7 +180,6 @@ def run_monitor():
                     notified_ids.add(m_id)
                     has_new_notif = True
 
-        # Geheugen opslaan
         if has_new_notif:
             save_json_file(NOTIFIED_FILE, list(notified_ids))
             logging.info("Notificatie geheugen bijgewerkt.")
