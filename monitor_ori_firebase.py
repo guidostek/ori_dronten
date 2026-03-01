@@ -71,23 +71,26 @@ def push_meeting_to_firebase(meta_data, full_data=None):
             
         display_type = f"{dmu_name} - {label_val}" if label_val else dmu_name
         meeting_date = meta_data.get('date')
+        
+        # DE FIX: Haal de tijd op uit de vernieuwde API structuur
+        meeting_time = meta_data.get('startTime') or meta_data.get('time') or ''
 
         # 2. Check bestaande status in DB om de 'grijze bug' te voorkomen
         doc_ref = db.collection('vergaderingen').document(meeting_id)
         existing_doc = doc_ref.get()
         
-        # Basis payload
+        # Basis payload (Nu MÉT startTime)
         meeting_payload = {
             'id': meeting_id,
             'type': display_type,
             'date': meeting_date,
+            'startTime': meeting_time, # Toegevoegd zodat Flutter dit kan uitlezen!
             'location': meta_data.get('location', 'Onbekend'),
             'last_updated': firestore.SERVER_TIMESTAMP,
         }
 
         # Als synced nog niet bestaat in de payload, bepalen we het hier
         if existing_doc.exists:
-            # Als hij al in de DB stond maar geen 'synced' veld had -> True (legacy data)
             current_db_data = existing_doc.to_dict()
             meeting_payload['synced'] = current_db_data.get('synced', True)
         else:
@@ -117,7 +120,7 @@ def push_meeting_to_firebase(meta_data, full_data=None):
                 items_list.append({
                     'number': str(item.get('number', '')),
                     'title': item.get('title', 'Agendapunt'),
-                    'description': item.get('description', ''),
+                    'description': item.get('description', ''), # Neemt HTML tekst netjes mee voor Flutter
                     'documents': docs
                 })
             
@@ -134,18 +137,16 @@ def push_meeting_to_firebase(meta_data, full_data=None):
         return None, None
 
 def run_monitor():
-    logging.info("--- Start Firebase Meeting Monitor (Gecorrigeerd) ---")
+    logging.info("--- Start Firebase Meeting Monitor (Met StartTime Fix) ---")
     
     # Geheugen laden
-    seen_state = load_json_file(STATE_FILE) # Bewaart doc_counts
-    notified_ids = set(load_json_file(NOTIFIED_FILE)) # Bewaart welke IDs al gepusht zijn
+    seen_state = load_json_file(STATE_FILE) 
+    notified_ids = set(load_json_file(NOTIFIED_FILE)) 
 
     # Vensters bepalen
     now = datetime.now()
-    # We kijken 60 dagen terug om historie voor Raad/Oordeelsvorming te garanderen
     start_date_str = (now - timedelta(days=60)).strftime('%Y-%m-%d')
     
-    # We syncen documenten volledig voor alles tussen 2 weken geleden en 6 weken vooruit
     sync_start = now - timedelta(days=14)
     sync_end = now + timedelta(days=42)
 
@@ -167,7 +168,6 @@ def run_monitor():
             m_date_dt = datetime.strptime(m_date_raw[:10], '%Y-%m-%d')
             
             full_data = None
-            # Bepaal of we voor deze vergadering de volledige details (documenten) ophalen
             if sync_start <= m_date_dt <= sync_end:
                 detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
                 d_resp = requests.get(detail_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
@@ -181,7 +181,6 @@ def run_monitor():
             if full_data and m_id not in notified_ids:
                 total_docs = sum(len(i.get('documents', [])) for i in (full_data.get('items') or []))
                 
-                # Alleen notificeren als er daadwerkelijk documenten zijn
                 if total_docs > 0:
                     titel_notif = f"Nieuwe agenda: {display_type}"
                     body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
