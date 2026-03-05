@@ -70,7 +70,7 @@ def run_monitor():
 
     datum_grens = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
 
-    # --- DEEL 1: VERGADERINGEN ---
+# --- DEEL 1: VERGADERINGEN ---
     try:
         url = f"{DRONTEN_API_V2}/meetings?limit=40&sort=date_desc"
         resp = requests.get(url, headers=headers, cookies=cookies, timeout=30)
@@ -84,37 +84,44 @@ def run_monitor():
             m_id = str(meeting['id'])
             title = meeting.get('title') or "Vergadering"
             is_geheim = bool(meeting.get('confidential', 0))
-            
+
+            # --- HAAL DETAILS OP (VOOR DE AGENDAPUNTEN) ---
+            items_lijst = [] # Fallback: altijd een lege lijst als het mislukt
+            detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
+            try:
+                d_resp = requests.get(detail_url, headers=headers, cookies=cookies, timeout=20)
+                if d_resp.status_code == 200:
+                    items_lijst = d_resp.json().get('items', [])
+            except Exception as e:
+                print(f"Fout bij ophalen details voor {m_id}: {e}")
+
+            # Sla de vergadering op INCLUSIEF de agendapunten (items)
             db.collection('vergaderingen').document(m_id).set({
                 'id': int(m_id),
                 'title': title,
                 'date': m_date,
                 'confidential': is_geheim,
+                'items': items_lijst, # <--- De lijst met punten gaat hier het document in
                 'last_sync': firestore.SERVER_TIMESTAMP
             }, merge=True)
 
-            # Check voor notificatie (zoals origineel: we checken V1 op toegevoegde documenten)
+            # --- CHECK VOOR PUSH NOTIFICATIE ---
             if m_id not in notified_meetings:
-                detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
-                # We sturen de cookies ook mee naar V1, zodat hij verborgen documenten meetelt
-                d_resp = requests.get(detail_url, headers=headers, cookies=cookies, timeout=30)
-                
-                if d_resp.status_code == 200:
-                    full_data = d_resp.json()
-                    total_docs = sum(len(i.get('documents', [])) for i in (full_data.get('items') or []))
-                    
-                    if total_docs > 0:
-                        status_label = "[BESLOTEN] " if is_geheim else ""
-                        titel_notif = f"Nieuwe agenda: {status_label}{title}"
-                        body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
-                        
-                        send_push_notification(titel_notif, body_notif)
-                        notified_meetings.add(m_id)
-                        new_meetings_notified = True
+                # Tel documenten in de zojuist opgehaalde items_lijst
+                total_docs = sum(len(i.get('documents', [])) for i in items_lijst)
+
+                if total_docs > 0:
+                    status_label = "[BESLOTEN] " if is_geheim else ""
+                    titel_notif = f"Nieuwe agenda: {status_label}{title}"
+                    body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
+
+                    send_push_notification(titel_notif, body_notif)
+                    notified_meetings.add(m_id)
+                    new_meetings_notified = True
 
         if new_meetings_notified:
             save_notified(NOTIFIED_MEETINGS_FILE, notified_meetings)
-            
+
     except Exception as e:
         print(f"Fout bij agenda sync: {e}")
 
