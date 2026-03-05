@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import json
 import time
@@ -6,51 +5,61 @@ import firebase_admin
 from firebase_admin import credentials, auth
 from flask import Flask, request, jsonify
 
+# Pad configuratie
 FIREBASE_CRED = "/home/guido/oriscript/serviceAccountKey.json"
-SESSION_DIR = "sessions"
+SESSION_DIR = "/home/guido/dronten-raad-app/sessions"
 
+# Initialiseer Firebase
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED)
     firebase_admin.initialize_app(cred)
 
 app = Flask(__name__)
 
+# Zorg dat de sessie map bestaat
 if not os.path.exists(SESSION_DIR):
     os.makedirs(SESSION_DIR)
 
-def verify_firebase_token(id_token):
+def verify_token(id_token):
     try:
-        # Dit controleert of de gebruiker echt is wie hij zegt dat hij is via Firebase
         decoded_token = auth.verify_id_token(id_token)
         return decoded_token['uid']
-    except Exception:
+    except Exception as e:
+        print(f"Token verificatie fout: {e}")
         return None
 
-@app.route('/proxy/save_session', methods=['POST'])
+@app.route('/save_session', methods=['POST'])
 def save_session():
-    """Ontvangt de cookies van de Flutter app na een geslaagde Microsoft login."""
     data = request.json
-    id_token = data.get('id_token')
-    cookies = data.get('cookies') # De cookies die de Flutter app heeft opgevangen
-
-    uid = verify_firebase_token(id_token)
+    uid = verify_token(data.get('id_token'))
+    
     if not uid:
         return jsonify({"status": "error", "message": "Niet geautoriseerd"}), 401
 
-    if not cookies:
-        return jsonify({"status": "error", "message": "Geen sessie data ontvangen"}), 400
-
     session_data = {
-        "cookies": cookies,
-        "created_at": time.time(),
-        "uid": uid
+        "uid": uid,
+        "cookies": data.get('cookies'),
+        "updated_at": time.time()
     }
-    
-    with open(os.path.join(SESSION_DIR, f"{uid}.json"), 'w') as f:
+
+    file_path = os.path.join(SESSION_DIR, f"{uid}.json")
+    with open(file_path, 'w') as f:
         json.dump(session_data, f)
     
-    return jsonify({"status": "success", "message": "Sessie veilig opgeslagen op de Pi"}), 200
+    return jsonify({"status": "success"}), 200
 
-if __name__ == "__main__":
-    # We draaien intern op 5000, Nginx handelt de buitenwereld (HTTPS) af
-    app.run(host='127.0.0.1', port=5000)
+@app.route('/check_session/<uid>', methods=['GET'])
+def check_session(uid):
+    file_path = os.path.join(SESSION_DIR, f"{uid}.json")
+    
+    if os.path.exists(file_path):
+        return jsonify({"status": "valid"}), 200
+    else:
+        return jsonify({"status": "not_found"}), 404
+
+@app.route('/')
+def home():
+    return "Pi API is online!", 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
