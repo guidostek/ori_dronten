@@ -44,13 +44,23 @@ def save_notified(filepath, data_set):
     with open(filepath, 'w') as f:
         json.dump(list(data_set), f)
 
-def send_push_notification(title, body):
+# Proactief opgelost: doc_id als optionele parameter toegevoegd
+def send_push_notification(title, body, doc_id=""):
     try:
         message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
-            topic='raad_updates',
+            # Zorgt voor de zichtbare pop-up op de telefoon
+            notification=messaging.Notification(
+                title=title,
+                body=body
+            ),
+            # Zorgt voor de silent push / data trigger op de achtergrond
+            data={
+                'trigger': 'sync_documents',
+                'document_id': str(doc_id)
+            },
+            topic='all_users' # Of naar specifieke FCM tokens
         )
-        messaging.send(message)
+        messaging.send(message)        
         print(f"Notificatie verstuurd: {title}")
     except Exception as e:
         print(f"FCM Fout bij sturen van notificatie: {e}")
@@ -70,7 +80,7 @@ def run_monitor():
 
     datum_grens = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
 
-# --- DEEL 1: VERGADERINGEN ---
+    # --- DEEL 1: VERGADERINGEN ---
     try:
         url = f"{DRONTEN_API_V2}/meetings?limit=40&sort=date_desc"
         resp = requests.get(url, headers=headers, cookies=cookies, timeout=30)
@@ -115,6 +125,7 @@ def run_monitor():
                     titel_notif = f"Nieuwe agenda: {status_label}{title}"
                     body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
 
+                    # Geeft geen doc_id mee, want dit is een vergadering
                     send_push_notification(titel_notif, body_notif)
                     notified_meetings.add(m_id)
                     new_meetings_notified = True
@@ -147,9 +158,12 @@ def run_monitor():
             # Check voor notificatie van losse nieuwe documenten
             if doc_id not in notified_docs:
                 status_label = "[BESLOTEN] " if is_geheim else ""
+                
+                # Proactieve aanpassing: Hier sturen we de doc_id wél mee!
                 send_push_notification(
                     title="Nieuw Raadstuk geplaatst", 
-                    body=f"{status_label}{title}"
+                    body=f"{status_label}{title}",
+                    doc_id=doc_id 
                 )
                 notified_docs.add(doc_id)
                 new_docs_notified = True
@@ -162,4 +176,3 @@ def run_monitor():
 
 if __name__ == "__main__":
     run_monitor()
-
