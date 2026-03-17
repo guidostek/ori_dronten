@@ -15,7 +15,6 @@ DRONTEN_API_V1 = "https://gemeenteraad.dronten.nl/api/v1"
 DRONTEN_API_V2 = "https://gemeenteraad.dronten.nl/api/v2"
 BASE_URL_PUBLIC = "https://gemeenteraad.dronten.nl"
 
-# Bestanden om bij te houden waarvoor al een push is verstuurd
 NOTIFIED_MEETINGS_FILE = "/home/guido/oriscript/notified_meetings.json"
 NOTIFIED_DOCS_FILE = "/home/guido/oriscript/notified_docs.json"
 
@@ -26,8 +25,7 @@ if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- HULPFUNCTIES VOOR NOTIFICATIES EN COOKIES ---
-
+# --- HULPFUNCTIES ---
 def get_user_cookies(uid):
     session_path = os.path.join(SESSION_DIR, f"{uid}.json")
     if os.path.exists(session_path):
@@ -50,87 +48,88 @@ def save_notified(filepath, data_set):
 def send_push_notification(title, body, doc_id=""):
     try:
         message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            data={
-                'trigger': 'sync_documents',
-                'document_id': str(doc_id)
-            },
+            notification=messaging.Notification(title=title, body=body),
+            data={'trigger': 'sync_documents', 'document_id': str(doc_id)},
             topic='all_users'
         )
-        messaging.send(message)        
-        print(f"Notificatie verstuurd: {title}")
+        messaging.send(message)
     except Exception as e:
-        print(f"FCM Fout bij sturen van notificatie: {e}")
+        print(f"FCM Fout: {e}")
 
-# --- NIEUW: MEDIA SCRAPER ---
-
-def extract_media_from_url(relative_url, headers, cookies):
-    """
-    Scrapet de publieke vergaderpagina voor audio/video links.
-    """
+# --- MEDIA SCRAPER: GLOBAAL (MP3) & PER ITEM (MP4 + TIMING) ---
+def extract_media_enriched(relative_url, headers, cookies, items_lijst):
     if not relative_url:
-        return []
+        return [], items_lijst
         
     full_url = f"{BASE_URL_PUBLIC}{relative_url}"
-    media_links = []
+    meeting_media = []
     
     try:
         response = requests.get(full_url, headers=headers, cookies=cookies, timeout=15)
         if response.status_code != 200:
-            return media_links
+            return meeting_media, items_lijst
 
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # 1. Zoek naar iFrames (Notubiz / Videoverslagen)
-        iframes = soup.find_all('iframe')
-        for iframe in iframes:
-            src = iframe.get('src')
-            if src:
-                if any(provider in src for provider in ['notubiz', 'youtube', 'vimeo', 'raadsinformatie']):
-                    media_links.append({
-                        'title': 'Videoverslag / Stream',
-                        'url': src if src.startswith('http') else f"https:{src}",
+        # 1. GLOBAAL: Zoek de volledige MP3 opname van de vergadering
+        # Vaak in de sidebar of onder een download-knop
+        for a in soup.find_all('a', href=re.compile(r'\.mp3$', re.I)):
+            href = a.get('href')
+            url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
+            if not any(m['url'] == url for m in meeting_media):
+                meeting_media.append({
+                    'title': 'Volledige audio-opname',
+                    'url': url,
+                    'type': 'audio'
+                })
+
+        # 2. PER ITEM: Zoek anchors (#) en MP4 fragmenten
+        for item in items_lijst:
+            item_title = item.get('title', '')
+            if not item_title: continue
+            
+            # Zoek de container waar dit agendapunt in staat
+            container = soup.find(lambda tag: tag.name in ['div', 'li', 'tr'] and item_title in tag.get_text())
+            
+            if container:
+                # Sla de anchor ID op voor directe navigatie op de webpagina
+                anchor_id = container.get('id')
+                if anchor_id:
+                    item['anchor'] = f"#{anchor_id}"
+                
+                # Zoek naar MP4 fragmenten of video-iframes binnen dit specifieke blok
+                item_media = []
+                for link in container.find_all('a', href=re.compile(r'\.mp4$', re.I)):
+                    href = link.get('href')
+                    url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
+                    item_media.append({
+                        'title': 'Videofragment',
+                        'url': url,
                         'type': 'video'
                     })
-
-        # 2. Zoek naar directe audio/video bestanden (.mp3, .mp4)
-        file_links = soup.find_all('a', href=re.compile(r'\.(mp3|mp4|m4a)$', re.I))
-        for link in file_links:
-            href = link.get('href')
-            title = link.get_text(strip=True) or "Media bestand"
-            if href.startswith('/'):
-                href = f"{BASE_URL_PUBLIC}{href}"
-            
-            media_links.append({
-                'title': title,
-                'url': href,
-                'type': 'audio' if href.lower().endswith('.mp3') else 'video'
-            })
+                
+                # Check ook op data-attributes voor video-starttijden (Notubiz/GemeenteOplossingen)
+                start_time = container.get('data-start') or container.get('data-time')
+                if start_time:
+                    item['start_time'] = start_time
+                
+                item['item_media'] = item_media
 
     except Exception as e:
-        print(f"[-] Fout tijdens scrapen van {full_url}: {e}")
+        print(f"Scrape fout op {full_url}: {e}")
         
-    return media_links
+    return meeting_media, items_lijst
 
 # --- HOOFD MONITOR LOGICA ---
-
 def run_monitor():
     cookies = get_user_cookies(MY_UID)
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # Laad de geschiedenis van notificaties
     notified_meetings = load_notified(NOTIFIED_MEETINGS_FILE)
     notified_docs = load_notified(NOTIFIED_DOCS_FILE)
-    
     new_meetings_notified = False
-    new_docs_notified = False
 
     datum_grens = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
 
-    # --- DEEL 1: VERGADERINGEN ---
     try:
         url = f"{DRONTEN_API_V2}/meetings?limit=40&sort=date_desc"
         resp = requests.get(url, headers=headers, cookies=cookies, timeout=30)
@@ -138,97 +137,42 @@ def run_monitor():
 
         for meeting in meetings:
             m_date = meeting.get('date', '')
-            if m_date < datum_grens:
-                continue
+            if m_date < datum_grens: continue
 
             m_id = str(meeting['id'])
-            title = meeting.get('title') or "Vergadering"
-            is_geheim = bool(meeting.get('confidential', 0))
-            relative_url = meeting.get('url')
-
-            # --- NIEUW: MEDIA EXTRACTIE ---
-            media_attachments = extract_media_from_url(relative_url, headers, cookies)
-
-            # --- HAAL DETAILS OP (VOOR DE AGENDAPUNTEN) ---
             items_lijst = [] 
             detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
             try:
                 d_resp = requests.get(detail_url, headers=headers, cookies=cookies, timeout=20)
                 if d_resp.status_code == 200:
                     items_lijst = d_resp.json().get('items', [])
-            except Exception as e:
-                print(f"Fout bij ophalen details voor {m_id}: {e}")
+            except: pass
 
-            # Sla de vergadering op INCLUSIEF media_attachments
+            # Scrape en verrijk
+            m_media, enriched_items = extract_media_enriched(meeting.get('url'), headers, cookies, items_lijst)
+
             db.collection('vergaderingen').document(m_id).set({
                 'id': int(m_id),
-                'title': title,
+                'title': meeting.get('title') or "Vergadering",
                 'date': m_date,
                 'startTime': meeting.get('startTime', ''),
-                'confidential': is_geheim,
-                'description': meeting.get('description', ''),
-                'dmu': meeting.get('dmu'),
-                'meetingLabel': meeting.get('meetingLabel'),
-                'location': meeting.get('location'),
-                'items': items_lijst,
-                'media_attachments': media_attachments, # <--- Hier worden de links opgeslagen
-                'url_public': f"{BASE_URL_PUBLIC}{relative_url}" if relative_url else "",
+                'confidential': bool(meeting.get('confidential', 0)),
+                'items': enriched_items,
+                'media_attachments': m_media, # Bevat de volledige MP3
+                'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
                 'last_sync': firestore.SERVER_TIMESTAMP
             }, merge=True)
 
-            # --- CHECK VOOR PUSH NOTIFICATIE ---
             if m_id not in notified_meetings:
-                total_docs = sum(len(i.get('documents', [])) for i in items_lijst)
-
-                if total_docs > 0:
-                    status_label = "[BESLOTEN] " if is_geheim else ""
-                    titel_notif = f"Nieuwe agenda: {status_label}{title}"
-                    body_notif = f"Datum: {m_date[:10]} met {total_docs} documenten beschikbaar."
-
-                    send_push_notification(titel_notif, body_notif)
-                    notified_meetings.add(m_id)
-                    new_meetings_notified = True
+                send_push_notification(f"Nieuwe agenda: {meeting.get('title')}", f"Datum: {m_date[:10]}")
+                notified_meetings.add(m_id)
+                new_meetings_notified = True
 
         if new_meetings_notified:
             save_notified(NOTIFIED_MEETINGS_FILE, notified_meetings)
 
     except Exception as e:
-        print(f"Fout bij agenda sync: {e}")
-
-    # --- DEEL 2: RAADSTUKKEN (Global Docs) ---
-    try:
-        url = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50"
-        resp = requests.get(url, headers=headers, cookies=cookies, timeout=20)
-        docs = resp.json().get('result', {}).get('documents', [])
-
-        for doc in docs:
-            doc_id = str(doc['id'])
-            is_geheim = bool(doc.get('confidential', 0))
-            title = doc.get('description') or doc.get('filename') or doc.get('original_filename') or f"Stuk {doc_id}"
-
-            db.collection('raadstukken').document(doc_id).set({
-                'id': int(doc_id),
-                'title': title,
-                'confidential': is_geheim,
-                'url': f"{DRONTEN_API_V2}/documents/{doc_id}/download",
-                'timestamp': firestore.SERVER_TIMESTAMP
-            }, merge=True)
-            
-            if doc_id not in notified_docs:
-                status_label = "[BESLOTEN] " if is_geheim else ""
-                send_push_notification(
-                    title="Nieuw Raadstuk geplaatst", 
-                    body=f"{status_label}{title}",
-                    doc_id=doc_id 
-                )
-                notified_docs.add(doc_id)
-                new_docs_notified = True
-
-        if new_docs_notified:
-            save_notified(NOTIFIED_DOCS_FILE, notified_docs)
-
-    except Exception as e:
-        print(f"Fout bij docs sync: {e}")
+        print(f"Monitor Fout: {e}")
 
 if __name__ == "__main__":
     run_monitor()
