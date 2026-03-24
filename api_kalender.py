@@ -1,121 +1,111 @@
 # -*- coding: utf-8 -*-
-import os
-import firebase_admin
-from firebase_admin import credentials, firestore
-from datetime import datetime, timedelta
-from flask import Flask, Response, abort
-from icalendar import Calendar, Event
-import pytz
 import logging
+import re
+import os
+from flask import Flask, Response, request
+from icalendar import Calendar, Event
+from firebase_admin import credentials, firestore, initialize_app, get_app
+from dateutil import parser
+from datetime import timedelta, datetime
+import pytz
 
-# Maak de log-map aan als deze nog niet bestaat
-os.makedirs("/home/guido/logs", exist_ok=True)
-
-# --- GLOBALE LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("/home/guido/logs/api_kalender.log"),
-        logging.StreamHandler()
-    ]
-)
-
-logging.info("--- Start API Kalender Service ---")
-
-# --- CONFIGURATIE ---
-CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
-
-# --- FIREBASE INITIALISATIE ---
-db = None
-try:
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(CRED_PATH)
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logging.info("Verbinden met Firebase geslaagd voor kalender API.")
-except Exception as e:
-    logging.error(f"FATALE FOUT bij Firebase initialisatie: {e}")
-
-# --- FLASK APP INITIALISATIE ---
+# --- INITIALISATIE ---
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-@app.route('/calendar/<user_token>.ics', methods=['GET'])
-def get_calendar_feed(user_token):
-    logging.info(f"Kalender feed opgevraagd voor token: {user_token}")
-    
-    if db is None:
-        abort(500, description="Database verbinding momenteel niet beschikbaar.")
+# Het volledige pad naar de key op de Pi
+CREDENTIALS_PATH = '/home/guido/oriscript/serviceAccountKey.json'
 
-    # 1. Beveiliging: Verifieer token in 'users' collectie
-    try:
-        users_ref = db.collection('users').where('calendarToken', '==', user_token).limit(1).stream()
-        user_doc = next(users_ref, None)
-        
-        if not user_doc:
-            logging.warning(f"Ongeldige kalender aanvraag. Token niet gevonden: {user_token}")
-            abort(401, description="Ongeldig of ontbrekend token. Toegang geweigerd.")
-    except Exception as e:
-        logging.error(f"Database fout tijdens token validatie: {e}")
-        abort(500, description="Interne server fout.")
+try:
+    firebase_app = get_app()
+except ValueError:
+    if not os.path.exists(CREDENTIALS_PATH):
+        logging.error(f"FOUT: {CREDENTIALS_PATH} niet gevonden!")
+        exit(1)
+    cred = credentials.Certificate(CREDENTIALS_PATH)
+    firebase_app = initialize_app(cred)
+
+db = firestore.client()
+AMSTERDAM_TZ = pytz.timezone('Europe/Amsterdam')
+
+def strip_html(text):
+    """Verwijdert HTML tags voor een schone agenda."""
+    if not text: return ""
+    clean = re.compile('<.*?>')
+    return re.sub(clean, '', text)
+
+# --- DE ALGEMENE ROUTE ---
+# Deze 'catch-all' zorgt ervoor dat ELKE link werkt, met of zonder code.
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def general_feed(path):
+    logging.info(f"Verzoek ontvangen voor pad: /{path}")
     
-    # 2. Kalender opbouwen
     cal = Calendar()
-    cal.add('prodid', '-//Dronten Raad App//Agenda Sync//NL')
+    cal.add('prodid', '-//Dronten Raad App//guidostek//NL')
     cal.add('version', '2.0')
-    cal.add('x-wr-calname', 'Raad Dronten')
-    cal.add('calscale', 'GREGORIAN')
+    cal.add('x-wr-calname', 'Dronten Raadsagenda')
     
-    # 3. Vergaderingen ophalen (timeout via de Firebase SDK is hier impliciet, maar we vangen het af)
+    nu = datetime.now(AMSTERDAM_TZ)
+
     try:
-        vergaderingen_ref = db.collection('vergaderingen').stream()
+        # Haal alle vergaderingen op
+        vergaderingen = db.collection('vergaderingen').stream()
+        aantal_events = 0
+
+        for meeting in vergaderingen:
+            m_data = meeting.to_dict()
+            m_id = str(meeting.id)
+            
+            # Datum en tijd bepalen
+            m_date_str = m_data.get('date', '')
+            m_time_str = m_data.get('startTime') or m_data.get('time', '00:00')
+            
+            if not m_date_str: continue
+
+            try:
+                # Flexibele parsing
+                full_dt_str = f"{m_date_str} {m_time_str}".strip()
+                dt_start = parser.parse(full_dt_str, dayfirst=True)
+                
+                if dt_start.tzinfo is None:
+                    dt_start = AMSTERDAM_TZ.localize(dt_start)
+                
+                # Filter: Alleen vanaf nu
+                if dt_start < nu: continue
+                
+                # Event opbouwen
+                event = Event()
+                event.add('summary', m_data.get('name') or m_data.get('title') or "Vergadering")
+                event.add('dtstart', dt_start)
+                event.add('dtend', dt_start + timedelta(hours=2))
+                event.add('uid', f"meeting-{m_id}@noreply.guidostek.nl")
+                
+                # Locatie: Huis van de Gemeente Dronten
+                full_address = "Huis van de Gemeente Dronten, De Rede 1, 8232 EE Dronten"
+                loc = m_data.get('location', '')
+                event.add('location', f"{loc}, {full_address}" if loc and loc.lower() != "n.v.t." else full_address)
+                
+                # Beschrijving (schoonmaken)
+                event.add('description', strip_html(m_data.get('description', '')))
+                
+                cal.add_component(event)
+                aantal_events += 1
+
+            except Exception as e:
+                logging.warning(f"Sla item {m_id} over wegens parse-fout: {e}")
+
+        logging.info(f"Kalender verzonden met {aantal_events} items.")
+        return Response(
+            cal.to_ical(), 
+            mimetype='text/calendar', 
+            headers={"Content-Disposition": "attachment; filename=dronten_raad.ics"}
+        )
+
     except Exception as e:
-        logging.error(f"Kon vergaderingen niet ophalen: {e}")
-        abort(500, description="Kan data niet laden.")
+        logging.error(f"Fout in de feed: {e}")
+        return "Fout bij genereren kalender", 500
 
-    tz = pytz.timezone("Europe/Amsterdam")
-    
-    for meeting in vergaderingen_ref:
-        data = meeting.to_dict()
-        m_date_str = data.get('date')
-        m_time_str = data.get('startTime', '00:00')
-        
-        if not m_date_str:
-            continue
-            
-        try:
-            start_dt_str = f"{m_date_str} {m_time_str}"
-            if not m_time_str.strip():
-                start_dt = datetime.strptime(m_date_str, "%Y-%m-%d")
-            else:
-                start_dt = datetime.strptime(start_dt_str.strip(), "%Y-%m-%d %H:%M")
-            start_dt = tz.localize(start_dt)
-        except (ValueError, TypeError):
-            continue
-            
-        event = Event()
-        event.add('summary', data.get('title', 'Vergadering'))
-        event.add('dtstart', start_dt)
-        event.add('dtend', start_dt + timedelta(hours=2))
-        
-        specifieke_locatie = data.get('location', '').strip()
-        standaard_adres = "Huis van de Gemeente Dronten, De Rede 1, 8232 EE Dronten"
-        volledige_locatie = f"{specifieke_locatie}, {standaard_adres}" if specifieke_locatie else standaard_adres
-        event.add('location', volledige_locatie)
-        
-        meeting_id = meeting.id
-        description = f"Bekijk details of claim woordvoerderschap in de app:\nhttps://raaddronten.guidostek.nl/meeting/{meeting_id}"
-        event.add('description', description)
-        event.add('uid', f"meeting-{meeting_id}@raaddronten.guidostek.nl")
-        cal.add_component(event)
-        
-    logging.info(f"Kalender feed succesvol gegenereerd voor token: {user_token}")
-    return Response(
-        cal.to_ical(), 
-        mimetype='text/calendar', 
-        headers={"Content-Disposition": "attachment; filename=raad_dronten.ics"}
-    )
-
-if __name__ == "__main__":
-    logging.info("Start de Flask webserver op poort 5000...")
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == '__main__':
+    # We gebruiken poort 5005 om conflicten met andere software (zoals lighttpd) te vermijden
+    app.run(host='0.0.0.0', port=5005, debug=False)
