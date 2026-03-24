@@ -7,6 +7,13 @@ from firebase_admin import credentials, firestore, messaging
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import re
+import time # Nodig voor de 15 minuten wachttijd
+
+# --- NIEUWE IMPORTS VOOR FLASK & ICALENDAR ---
+from flask import Flask, Response, abort
+from icalendar import Calendar, Event
+import pytz
+import threading
 
 # --- CONFIGURATIE ---
 CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
@@ -24,6 +31,88 @@ if not firebase_admin._apps:
     cred = credentials.Certificate(CRED_PATH)
     firebase_admin.initialize_app(cred)
 db = firestore.client()
+
+# --- FLASK APP INITIALISATIE (KALENDER ENDPOINT) ---
+app = Flask(__name__)
+
+@app.route('/calendar/<user_token>.ics', methods=['GET'])
+def get_calendar_feed(user_token):
+    # 1. Beveiliging: Verifieer of het token in de Firestore 'users' collectie bestaat
+    users_ref = db.collection('users').where('calendarToken', '==', user_token).limit(1).stream()
+    user_doc = next(users_ref, None)
+    
+    if not user_doc:
+        abort(401, description="Ongeldig of ontbrekend token. Toegang geweigerd.")
+    
+    # 2. Start het opbouwen van het iCalendar bestand
+    cal = Calendar()
+    cal.add('prodid', '-//Dronten Raad App//Agenda Sync//NL')
+    cal.add('version', '2.0')
+    cal.add('x-wr-calname', 'Raad Dronten')
+    cal.add('calscale', 'GREGORIAN')
+    
+    # 3. Haal vergaderingen op uit de bestaande Firestore 'vergaderingen' collectie
+    vergaderingen_ref = db.collection('vergaderingen').stream()
+    tz = pytz.timezone("Europe/Amsterdam")
+    
+    for meeting in vergaderingen_ref:
+        data = meeting.to_dict()
+        
+        m_date_str = data.get('date') # bv. '2023-10-25'
+        m_time_str = data.get('startTime', '00:00') # bv. '19:30' of leeg
+        
+        if not m_date_str:
+            continue
+            
+        try:
+            # Converteer de string datum/tijd naar een correct datetime object
+            start_dt_str = f"{m_date_str} {m_time_str}"
+            
+            if not m_time_str.strip():
+                # Alleen een datum zonder specifieke starttijd
+                start_dt = datetime.strptime(m_date_str, "%Y-%m-%d")
+            else:
+                start_dt = datetime.strptime(start_dt_str.strip(), "%Y-%m-%d %H:%M")
+                
+            start_dt = tz.localize(start_dt)
+        except (ValueError, TypeError) as e:
+            # Sla over als de datum onjuist is opgemaakt
+            continue
+            
+        event = Event()
+        event.add('summary', data.get('title', 'Vergadering'))
+        event.add('dtstart', start_dt)
+        event.add('dtend', start_dt + timedelta(hours=2)) # Standaard 2 uur looptijd
+        
+        # --- NIEUW: Locatie verrijken met het adres van de gemeente ---
+        specifieke_locatie = data.get('location', '').strip()
+        standaard_adres = "Huis van de Gemeente Dronten, De Rede 1, 8232 EE Dronten"
+        
+        if specifieke_locatie:
+            # Als er een zaal bekend is (bijv. "Raadzaal"), combineren we dit
+            volledige_locatie = f"{specifieke_locatie}, {standaard_adres}"
+        else:
+            # Geen zaal bekend, gebruik alleen het algemene adres
+            volledige_locatie = standaard_adres
+            
+        event.add('location', volledige_locatie)
+        
+        # Deep-link naar de app
+        meeting_id = meeting.id
+        description = f"Bekijk details of claim woordvoerderschap in de app:\nhttps://raaddronten.guidostek.nl/meeting/{meeting_id}"
+        event.add('description', description)
+        
+        # Unieke ID voor de agenda-applicaties om updates te herkennen
+        event.add('uid', f"meeting-{meeting_id}@raaddronten.guidostek.nl")
+        
+        cal.add_component(event)
+        
+    # 4. Return het bestand in het juiste WebCal formaat
+    return Response(
+        cal.to_ical(), 
+        mimetype='text/calendar', 
+        headers={"Content-Disposition": "attachment; filename=raad_dronten.ics"}
+    )
 
 # --- HULPFUNCTIES ---
 def get_user_cookies(uid):
@@ -72,7 +161,6 @@ def extract_media_enriched(relative_url, headers, cookies, items_lijst):
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # 1. GLOBAAL: Zoek de volledige MP3 opname van de vergadering
-        # Vaak in de sidebar of onder een download-knop
         for a in soup.find_all('a', href=re.compile(r'\.mp3$', re.I)):
             href = a.get('href')
             url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
@@ -88,16 +176,13 @@ def extract_media_enriched(relative_url, headers, cookies, items_lijst):
             item_title = item.get('title', '')
             if not item_title: continue
             
-            # Zoek de container waar dit agendapunt in staat
             container = soup.find(lambda tag: tag.name in ['div', 'li', 'tr'] and item_title in tag.get_text())
             
             if container:
-                # Sla de anchor ID op voor directe navigatie op de webpagina
                 anchor_id = container.get('id')
                 if anchor_id:
                     item['anchor'] = f"#{anchor_id}"
                 
-                # Zoek naar MP4 fragmenten of video-iframes binnen dit specifieke blok
                 item_media = []
                 for link in container.find_all('a', href=re.compile(r'\.mp4$', re.I)):
                     href = link.get('href')
@@ -108,7 +193,6 @@ def extract_media_enriched(relative_url, headers, cookies, items_lijst):
                         'type': 'video'
                     })
                 
-                # Check ook op data-attributes voor video-starttijden (Notubiz/GemeenteOplossingen)
                 start_time = container.get('data-start') or container.get('data-time')
                 if start_time:
                     item['start_time'] = start_time
@@ -158,8 +242,9 @@ def run_monitor():
                 'startTime': meeting.get('startTime', ''),
                 'confidential': bool(meeting.get('confidential', 0)),
                 'items': enriched_items,
-                'media_attachments': m_media, # Bevat de volledige MP3
+                'media_attachments': m_media, 
                 'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
+                'location': meeting.get('location', ''), 
                 'last_sync': firestore.SERVER_TIMESTAMP
             }, merge=True)
 
@@ -174,5 +259,26 @@ def run_monitor():
     except Exception as e:
         print(f"Monitor Fout: {e}")
 
+# --- NIEUWE FUNCTIE VOOR DE 15-MINUTEN LOOP ---
+def monitor_loop():
+    while True:
+        try:
+            print(f"[{datetime.now()}] Start geplande monitor taak...")
+            run_monitor()
+            print(f"[{datetime.now()}] Monitor taak klaar. Wachten voor 15 minuten (900 sec)...")
+        except Exception as e:
+            print(f"[{datetime.now()}] Fout in monitor loop: {e}")
+        
+        # Slaap voor 15 minuten (900 seconden) voordat hij weer opnieuw begint
+        time.sleep(900) 
+
 if __name__ == "__main__":
-    run_monitor()
+    # 1. Start de herhalende monitor-lus in de achtergrond
+    print("Start de monitor taak in de achtergrond (elke 15 minuten)...")
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    
+    # 2. Start de Flask server om de iCalendar bestanden continu te serveren
+    print("Start de Flask webserver voor /calendar/ endpoint op poort 5000...")
+    # Pas host/port aan indien nodig voor jouw specifieke web-omgeving (zoals NGINX reverse proxy)
+    app.run(host='0.0.0.0', port=5000)

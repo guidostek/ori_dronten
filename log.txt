@@ -12,3 +12,16 @@ Traceback (most recent call last):
   File "/usr/lib/python3.11/webbrowser.py", line 66, in get
     raise Error("could not locate runnable browser")
 webbrowser.Error: could not locate runnable browser
+Refresh failed: ('invalid_grant: Bad Request', {'error': 'invalid_grant', 'error_description': 'Bad Request'}). Re-authenticating...
+Traceback (most recent call last):
+  File "/home/guido/oriscript/generate_fractie_agenda.py", line 199, in <module>
+    create_google_doc()
+  File "/home/guido/oriscript/generate_fractie_agenda.py", line 115, in create_google_doc
+    creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/guido/.local/lib/python3.11/site-packages/google_auth_oauthlib/flow.py", line 447, in run_local_server
+    webbrowser.get(browser).open(auth_url, new=1, autoraise=True)
+    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/webbrowser.py", line 66, in get
+    raise Error("could not locate runnable browser")
+webbrowser.Error: could not locate runnable browser
