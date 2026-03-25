@@ -7,3 +7,4 @@ Start controle...
 Aantal items gevonden: 20
 Geen nieuwe documenten.
 --- Start HA Monitor (Venster 6 weken) ---
+Docs sync fout: Timeout of 60.0s exceeded, last exception: 429 Quota exceeded.
