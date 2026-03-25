@@ -67,18 +67,54 @@ def save_notified(filepath, data_set):
     with open(filepath, 'w') as f:
         json.dump(list(data_set), f)
 
+# --- Notificaties ---
 def send_push_notification(title, body, doc_id=""):
     try:
         logging.info(f"Start versturen push notificatie: {title}")
-        message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
-            data={'trigger': 'sync_documents', 'document_id': str(doc_id)},
-            topic='all_users'
-        )
-        messaging.send(message)
-        logging.info("Push notificatie succesvol verzonden.")
+        
+        # Controleer of we toegang hebben tot de database
+        global db
+        if db is None:
+            logging.error("Kan notificatie niet versturen: Geen Firebase database verbinding actief.")
+            return
+
+        # Stap 1: Haal alle geregistreerde tokens op
+        users_ref = db.collection('users').stream()
+        tokens = []
+        for user in users_ref:
+            user_data = user.to_dict()
+            token = user_data.get('fcmToken')
+            if token:
+                tokens.append(token)
+                
+        if not tokens:
+            logging.warning("Geen FCM tokens gevonden in de 'users' collectie. Notificatie geannuleerd.")
+            return
+
+        logging.info(f"Gevonden FCM tokens: {len(tokens)}. Bericht wordt nu klaargezet...")
+
+        # Stap 2 & 3: Verstuur berichten één-voor-één
+        success_count = 0
+        failure_count = 0
+        
+        for token in tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(title=title, body=body),
+                    data={'trigger': 'sync_documents', 'document_id': str(doc_id)},
+                    token=token
+                )
+                messaging.send(message)
+                success_count += 1
+            except Exception as e:
+                logging.error(f"Fout bij versturen naar token {token}: {e}")
+                failure_count += 1
+
+        # Stap 4: Log de resultaten
+        logging.info(f"Push notificatie verzonden. Succes: {success_count}, Gefaald: {failure_count}")
+
     except Exception as e:
-        logging.error(f"FCM Fout bij versturen notificatie: {e}")
+        logging.error(f"Fatale FCM Fout in de verzend-keten: {e}", exc_info=True)
 
 # --- MEDIA SCRAPER ---
 def extract_media_enriched(relative_url, headers, cookies, items_lijst):
@@ -140,9 +176,15 @@ def extract_media_enriched(relative_url, headers, cookies, items_lijst):
 
 # --- HOOFD MONITOR LOGICA ---
 def run_monitor():
+    logging.info("DEBUG: We zijn binnen in run_monitor!")
     if db is None:
         logging.error("Kan monitor niet draaien: Geen Firebase verbinding.")
         return
+    
+    # --- TIJDELIJKE TEST ---
+    huidige_tijd = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    send_push_notification(f"Systeem Test - {huidige_tijd}", "Dit is een controlebericht vanuit de backend om de verbinding te monitoren.")
+    # -----------------------
 
     cookies = get_user_cookies(MY_UID)
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -164,6 +206,71 @@ def run_monitor():
             if m_date < datum_grens: continue
 
             m_id = str(meeting['id'])
+            
+            # --- NIEUWE LOGICA: Controleer eerst of hij al in Firebase staat ---
+            # We halen het document op uit de database om te kijken of hij bestaat
+            doc_ref = db.collection('vergaderingen').document(m_id)
+            doc_snap = doc_ref.get(timeout=10)
+            
+            if doc_snap.exists:
+                doc_data = doc_snap.to_dict()
+                needs_update = False
+                update_data = {}
+
+                # 1. Controleer op verplaatsingen (datum of tijd gewijzigd)
+                if doc_data.get('date') != m_date or doc_data.get('startTime') != meeting.get('startTime'):
+                    needs_update = True
+                    update_data['date'] = m_date
+                    update_data['startTime'] = meeting.get('startTime')
+                    logging.info(f"Wijziging: Vergadering {m_id} is verplaatst.")
+
+                # 2. Controleer op wijzigingen in de titel (bijv. toevoeging van "[GEANNULEERD]")
+                api_title = meeting.get('title') or "Vergadering"
+                if doc_data.get('title') != api_title:
+                    needs_update = True
+                    update_data['title'] = api_title
+                    logging.info(f"Wijziging: Titel van vergadering {m_id} is aangepast.")
+
+                # 3. Controleer op NIEUWE documenten (zonder oude te overschrijven)
+                detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
+                try:
+                    d_resp = requests.get(detail_url, headers=headers, cookies=cookies, timeout=15)
+                    if d_resp.status_code == 200:
+                        api_items = d_resp.json().get('items', [])
+                        
+                        # Haal bestaande document ID's op uit Firebase
+                        existing_items = doc_data.get('items', [])
+                        existing_item_ids = [item.get('id') for item in existing_items if 'id' in item]
+                        
+                        # Filter alleen de documenten die we nog niet hebben
+                        new_items = [item for item in api_items if item.get('id') not in existing_item_ids]
+                        
+                        if new_items:
+                            needs_update = True
+                            logging.info(f"Wijziging: {len(new_items)} nieuwe documenten gevonden voor vergadering {m_id}.")
+                            
+                            # Verwerk ALLEEN de nieuwe items met je bestaande functie
+                            _, enriched_new_items = extract_media_enriched(meeting.get('url'), headers, cookies, new_items)
+                            
+                            # Voeg de nieuwe items samen met de bestaande items
+                            update_data['items'] = existing_items + enriched_new_items
+                except Exception as e:
+                    logging.warning(f"Fout bij ophalen document-details voor bestaande vergadering {m_id}: {e}")
+
+                # 4. Voer de update alleen uit als er daadwerkelijk iets is veranderd
+                if needs_update:
+                    update_data['last_sync'] = firestore.SERVER_TIMESTAMP
+                    # Gebruik .update() in plaats van .set() om alleen specifieke velden te wijzigen
+                    doc_ref.update(update_data, timeout=15)
+                    logging.info(f"Vergadering {m_id} succesvol bijgewerkt in Firebase.")
+                else:
+                    logging.info(f"Geen actie nodig. Vergadering {m_id} is up-to-date.")
+                
+                # Ga door naar de volgende vergadering in de for-loop
+                continue            # -------------------------------------------------------------------
+
+            # Vanaf hier komen we alleen als de vergadering nog NIET in de database staat
+            logging.info(f"Nieuwe vergadering gevonden ({m_id}). Details ophalen...")
             items_lijst = [] 
             detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
             
@@ -177,7 +284,7 @@ def run_monitor():
 
             m_media, enriched_items = extract_media_enriched(meeting.get('url'), headers, cookies, items_lijst)
 
-            logging.info(f"Schrijven vergadering {m_id} naar Firestore...")
+            logging.info(f"Schrijven nieuwe vergadering {m_id} naar Firestore...")
             
             # CRUCIALE FIX: Timeout op Firestore schrijfactie
             db.collection('vergaderingen').document(m_id).set({
@@ -204,11 +311,11 @@ def run_monitor():
 
     except Exception as e:
         logging.error(f"Monitor Fout in run_monitor(): {e}", exc_info=True)
+    finally:
+        logging.info("--- Einde ORI Monitor Run ---")
 
 if __name__ == "__main__":
     try:
         run_monitor()
     except Exception as e:
-        logging.error(f"Onverwachte fout in script executie: {e}", exc_info=True)
-    finally:
-        logging.info("--- Einde ORI Monitor Run ---")
+        logging.error(f"Fatale fout bij het starten van de monitor: {e}", exc_info=True)
