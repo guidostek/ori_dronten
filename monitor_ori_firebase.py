@@ -2,6 +2,8 @@
 import requests
 import json
 import os
+import sys
+import fcntl  # Dit is nieuw: helpt ons om een 'slot' op het script te zetten
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
 from datetime import datetime, timedelta
@@ -22,7 +24,18 @@ logging.basicConfig(
     ]
 )
 
-logging.info("--- Start Gecorrigeerde ORI Monitor Run ---")
+# --- ANTI-OVERLAP SLOTJE (CRUCIALE FIX) ---
+# Dit zorgt ervoor dat de cronjob nooit 2 scripts tegelijk kan laten draaien
+lock_file_path = '/tmp/monitor_ori.lock'
+lock_file = open(lock_file_path, 'w')
+try:
+    # Probeer het slotje op te eisen exclusief voor dit script
+    fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    logging.warning("Script draait al! We stoppen deze overlappende run om loops te voorkomen.")
+    sys.exit(0) # Stop onmiddellijk!
+
+logging.info("--- Start Veilige ORI Monitor Run ---")
 
 # --- CONFIGURATIE ---
 CRED_PATH = "/home/guido/oriscript/serviceAccountKey.json"
@@ -43,7 +56,6 @@ try:
         cred = credentials.Certificate(CRED_PATH)
         firebase_admin.initialize_app(cred)
     db = firestore.client()
-    logging.info("Verbinden met Firebase geslaagd.")
 except Exception as e:
     logging.error(f"FATALE FOUT bij Firebase initialisatie: {e}")
 
@@ -66,37 +78,45 @@ def load_notified(filepath):
     return set()
 
 def save_notified(filepath, data_set):
-    with open(filepath, 'w') as f:
-        json.dump(list(data_set), f)
-
-# --- NOTIFICATIE LOGICA ---
-def send_push_notification(title, body, doc_id="", link=""):
-    """Verstuurt pushberichten met een directe link naar het document."""
+    """Slaat data robuust op."""
     try:
-        logging.info(f"Aanroepen FCM voor {doc_id}. Link aanwezig: {bool(link)}")
-        
-        # Voorkom crashes door datatypes te forceren naar strings en in te korten
-        safe_title = str(title)[:100]
+        data_list = list(data_set)
+        temp_file = filepath + ".tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(data_list, f)
+            f.flush()
+            os.fsync(f.fileno()) 
+        os.replace(temp_file, filepath)
+    except Exception as e:
+        logging.error(f"Fout bij opslaan cache {filepath}: {e}")
+
+# --- NOTIFICATIE LOGICA (IN TEST MODUS!) ---
+#def send_push_notification(title, body, doc_id="", link=""):
+#    """
+#    TEST MODUS: Print alleen in het logboek, stuurt NIETS naar telefoons.
+#    Zo voorkomen we spam terwijl we controleren of de loop weg is.
+#    """
+#    logging.info(f"👉 [TEST-MODUS] Zou nu notificatie sturen: '{title}' voor document: {doc_id}")
+    # De daadwerkelijke verzend-code is tijdelijk verwijderd voor de rust.
+    
+# --- NOTIFICATIE LOGICA (LIVE!) ---
+def send_push_notification(title, body, doc_id="", link=""):
+    """Verstuurt de pushberichten daadwerkelijk naar de app."""
+    try:
+        # We maken de tekst veilig om crashes te voorkomen
+        safe_title = str(title)[:150]
         safe_body = str(body)[:500]
         
         global db
-        if db is None:
-            logging.error("FCM afgebroken: Geen DB verbinding.")
-            return
+        if db is None: return
 
-        # Haal tokens op uit de 'users' collectie
+        # Haal alle actieve tokens op uit de Firebase database
         users_ref = db.collection('users').stream()
-        tokens = []
-        for user in users_ref:
-            token = user.to_dict().get('fcmToken')
-            if token:
-                tokens.append(token)
+        tokens = [user.to_dict().get('fcmToken') for user in users_ref if user.to_dict().get('fcmToken')]
                 
-        if not tokens:
-            logging.warning("Geen actieve FCM tokens gevonden in database.")
-            return
+        if not tokens: return
 
-        # Verstuur berichten
+        # Stuur het bericht naar elke gebruiker
         success_count = 0
         for token in tokens:
             try:
@@ -104,41 +124,38 @@ def send_push_notification(title, body, doc_id="", link=""):
                     notification=messaging.Notification(title=safe_title, body=safe_body),
                     data={
                         'trigger': 'open_document', 
-                        'document_id': str(doc_id),
-                        'url': str(link)
+                        'document_id': str(doc_id), 
+                        'url': str(link) # Hier sturen we de verborgen link mee!
                     },
                     token=token
                 )
                 messaging.send(message)
                 success_count += 1
-            except Exception as e:
-                logging.debug(f"Kon niet sturen naar token {token}: {e}")
+            except Exception:
+                # Als een specifiek token niet meer werkt, negeren we die gewoon
+                pass 
 
         logging.info(f"Notificatie succesvol verzonden naar {success_count} apparaten.")
 
     except Exception as e:
-        logging.error(f"Fout in de notificatie-keten: {e}", exc_info=True)
+        logging.error(f"Fout in notificatie-keten: {e}")
+
 
 # --- SCRAPER FUNCTIE ---
 def extract_media_enriched(relative_url, headers, cookies, items_lijst):
-    """Scrapt audio en video fragmenten van de publieke pagina."""
-    if not relative_url:
-        return [], items_lijst
+    if not relative_url: return [], items_lijst
     full_url = f"{BASE_URL_PUBLIC}{relative_url}"
     meeting_media = []
     try:
         response = requests.get(full_url, headers=headers, cookies=cookies, timeout=15)
-        if response.status_code != 200:
-            return meeting_media, items_lijst
+        if response.status_code != 200: return meeting_media, items_lijst
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Audio check
         for a in soup.find_all('a', href=re.compile(r'\.mp3$', re.I)):
             href = a.get('href')
             url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
             meeting_media.append({'title': 'Volledige audio', 'url': url, 'type': 'audio'})
 
-        # Items verrijken met video
         for item in items_lijst:
             title = item.get('title', '')
             container = soup.find(lambda t: t.name in ['div', 'li'] and title in t.get_text())
@@ -148,45 +165,59 @@ def extract_media_enriched(relative_url, headers, cookies, items_lijst):
                     vids.append({'title': 'Videofragment', 'url': link.get('href'), 'type': 'video'})
                 item['item_media'] = vids
     except Exception as e:
-        logging.error(f"Fout tijdens scrapen van {full_url}: {e}")
+        logging.error(f"Fout tijdens scrapen: {e}")
     return meeting_media, items_lijst
 
 # --- HOOFD PROGRAMMA ---
 def run_monitor():
-    if db is None:
-        logging.error("Monitor gestopt: Geen Firebase.")
-        return
+    if db is None: return
     
     cookies = get_user_cookies(MY_UID)
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # Laad lokale cache bestanden
     notified_meetings = load_notified(NOTIFIED_MEETINGS_FILE)
     notified_docs = load_notified(NOTIFIED_DOCS_FILE)
     
+    vandaag_str = datetime.now().strftime('%Y-%m-%d')
     datum_grens = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
-    cache_gewijzigd = False # Houdt bij of we de json bestanden moeten opslaan
 
     # --- DEEL 1: CHECK LOSSE DOCUMENTEN (/documents) ---
     try:
-        logging.info("Checken op losse documenten...")
-        doc_api = f"{DRONTEN_API_V2}/documents?limit=20&sort=date_desc"
+        doc_api = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50"
         d_resp = requests.get(doc_api, headers=headers, cookies=cookies, timeout=20)
         
         if d_resp.status_code == 200:
             docs = d_resp.json().get('result', {}).get('documents', [])
             for d in docs:
                 d_id = str(d['id'])
-                cache_key = f"los_{d_id}" # Unieke sleutel voor losse documenten
+                cache_key = f"los_{d_id}"
                 
                 if cache_key not in notified_docs:
-                    d_title = str(d.get('title') or "Nieuw document")
-                    d_url = d.get('url_public') or ""
-                    
-                    send_push_notification("Nieuw document beschikbaar", d_title, f"doc_{d_id}", link=d_url)
-                    
                     notified_docs.add(cache_key)
-                    cache_gewijzigd = True
+                    save_notified(NOTIFIED_DOCS_FILE, notified_docs)
+
+                    d_title = str(d.get('description') or d.get('filename') or f"Stuk {d_id}")
+                    is_vertrouwelijk = d.get('confidential', False)
+                    d_url = f"{DRONTEN_API_V2}/documents/{d_id}/download"
+                    
+                    d_date_raw = str(d.get('date') or d.get('date_published') or d.get('created_at') or vandaag_str)
+                    d_date = d_date_raw[:10]
+
+                    if d_date >= vandaag_str:
+                        prefix = "🔒 Besloten: " if is_vertrouwelijk else "Nieuw document: "
+                        send_push_notification(f"{prefix}{d_title}", "Tik om document te openen", f"doc_{d_id}", link=d_url)
+                    
+                    try:
+                        db.collection('raadstukken').document(d_id).set({
+                            'id': d_id,
+                            'title': d_title,
+                            'confidential': is_vertrouwelijk,
+                            'url': d_url,
+                            'timestamp': firestore.SERVER_TIMESTAMP
+                        }, merge=True, timeout=5) 
+                    except Exception as e:
+                        logging.warning(f"Opslag DB los doc {d_id} overgeslagen: {e.__class__.__name__}")
+
     except Exception as e:
         logging.error(f"Fout bij losse documenten check: {e}")
 
@@ -205,13 +236,11 @@ def run_monitor():
             doc_ref = db.collection('vergaderingen').document(m_id)
             
             try:
-                doc_snap = doc_ref.get(timeout=10)
+                doc_snap = doc_ref.get(timeout=5)
             except Exception as e:
-                logging.error(f"Kon Firestore niet lezen voor {m_id} (Quota?): {e}")
                 continue
 
             if doc_snap.exists:
-                # Bestaande vergadering: Zoek naar nieuwe documenten
                 doc_data = doc_snap.to_dict()
                 detail_url = f"{DRONTEN_API_V1}/meetings/{m_id}"
                 
@@ -221,70 +250,48 @@ def run_monitor():
                         api_items = d_resp.json().get('items', [])
                         existing_ids = [i.get('id') for i in doc_data.get('items', []) if 'id' in i]
                         
-                        # Check ook in onze lokale notified_docs lijst!
                         new_items = []
                         for i in api_items:
                             item_id = str(i.get('id'))
                             cache_key = f"item_{item_id}"
                             
-                            # Alleen toevoegen als hij niet in firebase staat EN we nog geen notificatie hebben gestuurd
                             if i.get('id') not in existing_ids and cache_key not in notified_docs:
                                 new_items.append(i)
 
                         if new_items:
-                            logging.info(f"Wijziging: {len(new_items)} nieuwe documenten voor {m_id}")
+                            for i in new_items:
+                                notified_docs.add(f"item_{i.get('id')}")
+                            save_notified(NOTIFIED_DOCS_FILE, notified_docs)
                             
                             first_doc_url = new_items[0].get('resource_url') if new_items[0].get('resource_url') else ""
-                            titels = ", ".join([str(i.get('title', 'Document')) for i in new_items])[:150]
+                            titels = ", ".join([str(i.get('title', 'Document')) for i in new_items])
                             
-                            # Stuur notificatie (Eerst!)
-                            send_push_notification(f"Nieuwe stukken: {m_title}", f"Toegevoegd: {titels}", m_id, link=first_doc_url)
+                            if m_date >= vandaag_str:
+                                send_push_notification(f"Nieuwe stukken: {m_title}", f"Toegevoegd: {titels}", m_id, link=first_doc_url)
 
-                            # Sla lokaal op dat we deze hebben gemeld
-                            for i in new_items:
-                                item_id = str(i.get('id'))
-                                notified_docs.add(f"item_{item_id}")
-                            cache_gewijzigd = True
-
-                            # Verwerking: Probeer Firebase bij te werken (Daarna pas!)
                             _, enriched = extract_media_enriched(meeting.get('url'), headers, cookies, new_items)
                             try:
-                                doc_ref.update({
-                                    'items': doc_data.get('items', []) + enriched,
-                                    'last_sync': firestore.SERVER_TIMESTAMP
-                                }, timeout=15)
+                                doc_ref.update({'items': doc_data.get('items', []) + enriched, 'last_sync': firestore.SERVER_TIMESTAMP}, timeout=5)
                             except Exception as fire_err:
-                                logging.error(f"Firestore update mislukt voor {m_id}: {fire_err}. Notificatie is wel lokaal gemarkeerd.")
+                                logging.warning(f"Firestore update voor vergadering {m_id} overgeslagen: {fire_err.__class__.__name__}")
                 except Exception as e:
                     logging.warning(f"Detail check mislukt voor {m_id}: {e}")
             
             else:
-                # VOLLEDIG NIEUWE VERGADERING
                 if m_id not in notified_meetings:
-                    logging.info(f"Nieuwe agenda ontdekt: {m_id}")
-                    send_push_notification(f"Nieuwe agenda: {m_title}", f"Datum: {m_date[:10]}", m_id)
                     notified_meetings.add(m_id)
-                    cache_gewijzigd = True
+                    save_notified(NOTIFIED_MEETINGS_FILE, notified_meetings)
+                    
+                    if m_date >= vandaag_str:
+                        send_push_notification(f"Nieuwe agenda: {m_title}", f"Datum: {m_date[:10]}", m_id)
                 
-                # Probeer op te slaan in Firebase
                 try:
-                    doc_ref.set({
-                        'id': int(m_id),
-                        'title': m_title,
-                        'date': m_date,
-                        'last_sync': firestore.SERVER_TIMESTAMP
-                    }, merge=True, timeout=15)
+                    doc_ref.set({'id': int(m_id), 'title': m_title, 'date': m_date, 'last_sync': firestore.SERVER_TIMESTAMP}, merge=True, timeout=5)
                 except Exception as e:
-                    logging.error(f"Firestore set mislukt voor nieuwe vergadering {m_id}: {e}")
-
-        # Sla de lokale cache bestanden op als er iets is toegevoegd
-        if cache_gewijzigd:
-            save_notified(NOTIFIED_DOCS_FILE, notified_docs)
-            save_notified(NOTIFIED_MEETINGS_FILE, notified_meetings)
-            logging.info("Lokale notificatie-caches succesvol opgeslagen.")
+                    logging.warning(f"Firestore set mislukt voor {m_id}: {e.__class__.__name__}")
 
     except Exception as e:
-        logging.error(f"Algemene fout in monitor: {e}", exc_info=True)
+        logging.error(f"Algemene fout in monitor: {e}")
     finally:
         logging.info("--- Einde ORI Monitor Run ---")
 
