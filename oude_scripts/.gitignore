@@ -1,0 +1,6 @@
+*.backup
+*.log
+*.json
+trello*
+authenticate.py
+
