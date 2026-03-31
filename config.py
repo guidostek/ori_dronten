@@ -21,3 +21,9 @@ NOTIFIED_DOCS_FILE = os.path.join(BASE_DIR, "notified_docs.json")
 TIMEOUT_SECONDS = 20
 LIMIT_MEETINGS = 20
 LIMIT_DOCS = 50
+
+# --- NIEUW: DEEP SYNC INSTELLINGEN (Taak 1.1) ---
+# Deep Sync parameter ingesteld op 3 maanden voor de backend refactor
+DEEP_SYNC_MONTHS = 3
+# Omgezet naar dagen (ongeveer 90), wat makkelijker is voor datum-berekeningen in Python
+DEEP_SYNC_DAYS = DEEP_SYNC_MONTHS * 30
