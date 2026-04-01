@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter # Nieuw voor de warning
 from config import *
 from firebase_client import db
 from notification_service import send_push_notification
@@ -62,7 +63,7 @@ def extract_api_data(response_json, endpoint_naam="API"):
         return []
     return result if isinstance(result, list) else []
 
-# --- MEDIA SCRAPER (Met link-tekst extractie) ---
+# --- MEDIA SCRAPER (Verbeterd voor schone titels zoals 'J.N. Ammerlaan') ---
 
 def extract_media_enriched(relative_url, session, items_lijst):
     """
@@ -78,63 +79,64 @@ def extract_media_enriched(relative_url, session, items_lijst):
     
     try:
         response = session.get(full_url, timeout=15)
-        if response.status_code != 200:
-            return meeting_media, items_lijst, None
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+            # 1. Zoek HOOFD opnames (Audio & Video)
+            for a in soup.find_all('a', href=re.compile(r'\.(mp3|mp4)$', re.I)):
+                href = a.get('href')
+                url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
+                m_type = 'audio' if url.lower().endswith('.mp3') else 'video'
+                
+                if m_type == 'audio' and not full_audio_url:
+                    full_audio_url = url
 
-        # 1. Zoek HOOFD opnames (Audio & Video)
-        for a in soup.find_all('a', href=re.compile(r'\.(mp3|mp4)$', re.I)):
-            href = a.get('href')
-            url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
-            m_type = 'audio' if url.lower().endswith('.mp3') else 'video'
-            
-            if m_type == 'audio' and not full_audio_url:
-                full_audio_url = url
-
-            if not any(m['url'] == url for m in meeting_media):
-                meeting_media.append({
-                    'title': a.get_text(strip=True) or "Volledige opname",
-                    'url': url,
-                    'type': m_type
-                })
-
-        # Zoek naar video iframes
-        for iframe in soup.find_all('iframe'):
-            src = iframe.get('src')
-            if src and any(p in src for p in ['notubiz', 'youtube', 'vimeo', 'raadsinformatie']):
-                v_url = src if src.startswith('http') else f"https:{src}"
-                if not any(m['url'] == v_url for m in meeting_media):
+                if not any(m['url'] == url for m in meeting_media):
                     meeting_media.append({
-                        'title': 'Videoverslag / Stream',
-                        'url': v_url,
-                        'type': 'video'
+                        'title': a.get_text(strip=True) or "Volledige opname",
+                        'url': url,
+                        'type': m_type
                     })
 
-        # 2. Zoek fragmenten per agendapunt
-        for item in items_lijst:
-            title = item.get('title', '')
-            if not title: continue
-            
-            container = soup.find(lambda tag: tag.name in ['div', 'li', 'tr'] and title in tag.get_text())
-            
-            item_media = []
-            if container:
-                for link in container.find_all(['a', 'button'], href=True):
-                    href = link.get('href')
-                    if any(ext in href.lower() for ext in ['.mp3', '.mp4', '#t=', 'start=']):
-                        l_url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
-                        
-                        # Gebruik de tekst van de link voor een betere titel
-                        link_label = link.get_text(strip=True)
-                        display_title = f"{title}: {link_label}" if link_label else f"Fragment: {title}"
-                        
-                        item_media.append({
-                            'title': display_title,
-                            'url': l_url,
-                            'type': 'audio' if '.mp3' in l_url.lower() else 'video'
+            # Zoek naar video iframes (YouTube/Notubiz)
+            for iframe in soup.find_all('iframe'):
+                src = iframe.get('src')
+                if src and any(p in src for p in ['notubiz', 'youtube', 'vimeo', 'raadsinformatie']):
+                    v_url = src if src.startswith('http') else f"https:{src}"
+                    if not any(m['url'] == v_url for m in meeting_media):
+                        meeting_media.append({
+                            'title': 'Videoverslag / Stream',
+                            'url': v_url,
+                            'type': 'video'
                         })
-            item['item_media'] = item_media
+
+            # 2. Zoek fragmenten per agendapunt
+            for item in items_lijst:
+                title = item.get('title', '')
+                if not title: continue
+                
+                container = soup.find(lambda tag: tag.name in ['div', 'li', 'tr'] and title in tag.get_text())
+                
+                item_media = []
+                if container:
+                    for link in container.find_all(['a', 'button'], href=True):
+                        href = link.get('href')
+                        if any(ext in href.lower() for ext in ['.mp3', '.mp4', '#t=', 'start=']):
+                            l_url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
+                            
+                            # CHIRURGISCH: Gebruik de tekst van de link (bijv. de naam van de spreker)
+                            link_label = link.get_text(strip=True)
+                            
+                            # Als er een label is (zoals 'J.N. Ammerlaan'), gebruik die direct.
+                            # We plakken het agendapunt er niet meer voor om de lijst schoon te houden.
+                            display_title = link_label if link_label else f"Fragment: {title}"
+                            
+                            item_media.append({
+                                'title': display_title,
+                                'url': l_url,
+                                'type': 'audio' if '.mp3' in l_url.lower() else 'video'
+                            })
+                item['item_media'] = item_media
 
     except Exception as e:
         logging.warning(f"[-] Scraper fout bij {full_url}: {e}")
@@ -158,7 +160,6 @@ def run_deep_sync():
 
     batch = db.batch()
     batch_count = 0
-    
     processed_meeting_ids = set()
     api_item_ids = set()
     api_doc_ids = set()
@@ -186,14 +187,11 @@ def run_deep_sync():
             
             processed_meeting_ids.add(int(m_id))
             m_date = meeting.get('date', '')
-            
-            # Sla oude vergaderingen over
             if m_date < date_from_str: continue
 
             meeting_ref = db.collection('vergaderingen').document(m_id)
             meeting_snap = meeting_ref.get()
             existing_m = meeting_snap.to_dict() if meeting_snap.exists else {}
-            existing_items_dict = {i.get('id'): i for i in existing_m.get('items', []) if 'id' in i}
 
             # Haal agendapunten op
             updated_items_list = []
@@ -206,7 +204,6 @@ def run_deep_sync():
                     item_id = str(item.get('id'))
                     item_id_int = int(item_id)
                     api_item_ids.add(item_id_int)
-                    
                     item_title = item.get('title') or item.get('description') or f"Punt {item_id}"
                     
                     # Documenten per item
@@ -220,7 +217,7 @@ def run_deep_sync():
                             d_id = str(doc['id'])
                             api_doc_ids.add(int(d_id))
                             
-                            # DETAIL FETCH: Haal volledige metadata van het document op
+                            # Gedetailleerde metadata fetch
                             doc_info = doc
                             if DOC_DETAIL_DELAY > 0:
                                 time.sleep(DOC_DETAIL_DELAY)
@@ -276,7 +273,7 @@ def run_deep_sync():
                 'title': clean_html(meeting.get('description', '')) or meeting.get('title') or "Vergadering",
                 'date': m_date,
                 'confidential': bool(meeting.get('confidential', 0)),
-                'full_audio_url': full_audio,
+                'full_audio_url': full_audio, # <--- Voor de player bovenin
                 'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
                 'location': meeting.get('location', ''),
                 'items': enriched_items,
@@ -284,30 +281,28 @@ def run_deep_sync():
                 'last_sync': firestore.SERVER_TIMESTAMP
             }
 
-            # Uitgebreide vergelijking om updates te bepalen
-            meeting_needs_update = not meeting_snap.exists
-            if not meeting_needs_update:
+            # Bepaal of update nodig is
+            needs_update = not meeting_snap.exists
+            if not needs_update:
                 for k, v in new_meeting_data.items():
                     if str(existing_m.get(k)) != str(v):
-                        meeting_needs_update = True
+                        needs_update = True
                         break
 
-            if meeting_needs_update:
+            if needs_update:
                 batch.set(meeting_ref, new_meeting_data, merge=True)
                 batch_count += 1
                 commit_batch_if_needed()
                 
                 if m_id not in notified_meetings:
-                    # FIX: Geen doc_id argument meer om crash te voorkomen
                     send_push_notification(f"Nieuwe agenda: {new_meeting_data['title']}", f"Datum: {m_date[:10]}")
                     notified_meetings.add(m_id)
                     new_meetings_found = True
 
         # --- DEEL 2: GLOBALE RAADSTUKKEN SYNC ---
-        docs_url = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50"
-        d_resp = session.get(docs_url, timeout=TIMEOUT_SECONDS)
-        if d_resp.status_code == 200:
-            for d in extract_api_data(d_resp.json()):
+        g_resp = session.get(f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50", timeout=TIMEOUT_SECONDS)
+        if g_resp.status_code == 200:
+            for d in extract_api_data(g_resp.json()):
                 d_id = str(d['id'])
                 if d_id not in notified_docs:
                     title = d.get('description') or d.get('fileName') or f"Stuk {d_id}"
@@ -322,11 +317,11 @@ def run_deep_sync():
                     notified_docs.add(d_id)
                     new_docs_found = True
 
-        # --- DEEL 3: CLEANUP VAN VERWIJDERDE DATA ---
+        # --- DEEL 3: CLEANUP (Gecorrigeerd voor warning) ---
         if processed_meeting_ids:
             for mid in processed_meeting_ids:
                 for col, valid_ids in [('agendapunten', api_item_ids), ('raadstukken', api_doc_ids)]:
-                    query = db.collection(col).where('meeting_id', '==', mid).stream()
+                    query = db.collection(col).where(filter=FieldFilter('meeting_id', '==', mid)).stream()
                     for doc in query:
                         if int(doc.id) not in valid_ids:
                             batch.delete(doc.reference)
@@ -338,10 +333,8 @@ def run_deep_sync():
     except Exception as e:
         logging.error(f"Fout in run_deep_sync: {e}")
 
-    if new_meetings_found:
-        save_cache(NOTIFIED_MEETINGS_FILE, notified_meetings)
-    if new_docs_found:
-        save_cache(NOTIFIED_DOCS_FILE, notified_docs)
+    if new_meetings_found: save_cache(NOTIFIED_MEETINGS_FILE, notified_meetings)
+    if new_docs_found: save_cache(NOTIFIED_DOCS_FILE, notified_docs)
 
 if __name__ == "__main__":
     run_deep_sync()
