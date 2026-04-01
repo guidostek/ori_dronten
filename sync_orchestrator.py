@@ -2,6 +2,7 @@
 import requests
 import json
 import os
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 from firebase_admin import firestore
@@ -20,7 +21,6 @@ logging.basicConfig(
 )
 
 def load_cache(filepath):
-    """Laadt de lijst met reeds genotificeerde ID's."""
     if os.path.exists(filepath):
         try:
             with open(filepath, 'r') as f:
@@ -30,38 +30,32 @@ def load_cache(filepath):
     return set()
 
 def save_cache(filepath, data_set):
-    """Slaat de actuele lijst met genotificeerde ID's op."""
     with open(filepath, 'w') as f:
         json.dump(list(data_set), f)
 
 def get_sync_start_date_str():
-    """Berekent de startdatum (3 maanden terug) en geeft dit in YYYY-MM-DD formaat."""
     start_date = datetime.now(timezone.utc) - timedelta(days=DEEP_SYNC_DAYS)
     return start_date.strftime('%Y-%m-%d')
 
+def clean_html(raw_html):
+    if not raw_html:
+        return ""
+    cleanr = re.compile('<.*?>')
+    return re.sub(cleanr, '', raw_html).strip()
+
 def extract_api_data(response_json, endpoint_naam="API"):
-    """
-    Extraheert veilig de data array uit de API v2 response met uitgebreide logging.
-    """
     if not isinstance(response_json, dict):
         return response_json
         
     result = response_json.get("result", response_json)
     
     if isinstance(result, dict):
-        if "model" in result:
-            return result["model"]
-        elif "meetingitems" in result:
-            return result["meetingitems"]
-        elif "meetings" in result:
-            return result["meetings"]
-        elif "documents" in result:
-            return result["documents"]
-        elif "items" in result:
-            return result["items"]
-        else:
-            logging.warning(f"ONBEKENDE STRUCTUUR bij {endpoint_naam}. Gevonden keys: {list(result.keys())}")
-            return []
+        bekende_sleutels = ["model", "meetingitems", "meetings", "documents", "document", "items"]
+        for sleutel in bekende_sleutels:
+            if sleutel in result:
+                return result[sleutel]
+        logging.warning(f"ONBEKENDE STRUCTUUR bij {endpoint_naam}. Gevonden keys: {list(result.keys())}")
+        return []
             
     if isinstance(result, list):
         return result
@@ -69,7 +63,6 @@ def extract_api_data(response_json, endpoint_naam="API"):
     return []
 
 def run_deep_sync():
-    """Voert de exacte trapsgewijze deep sync uit volgens de API V2 documentatie."""
     date_from_str = get_sync_start_date_str()
     logging.info(f"Start Deep Sync vanaf datum: {date_from_str}")
 
@@ -79,9 +72,7 @@ def run_deep_sync():
     new_meetings_found = False
     new_docs_found = False
 
-    # STAP 1: MEETINGS OPHALEN
     meetings_url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&limit=50"
-    logging.info(f"Aanroepen API voor meetings: {meetings_url}")
     
     try:
         resp = requests.get(meetings_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
@@ -90,23 +81,40 @@ def run_deep_sync():
             return
 
         meetings = extract_api_data(resp.json(), endpoint_naam=meetings_url)
-        logging.info(f"Totaal aantal meetings gevonden in API: {len(meetings)}")
 
         for meeting in meetings:
             m_id = str(meeting.get('id'))
             if not m_id or m_id == 'None':
                 continue
+            
+            is_debug_target = (m_id in ['1467', '1468'])
                 
             m_date = meeting.get('date', '')
-            title = meeting.get('title') or "Vergadering"
+            raw_desc = meeting.get('description', '')
+            clean_desc = clean_html(raw_desc)
+            dmu_name = meeting.get('dmu', {}).get('name', '')
             
-            logging.info(f"--- Start verwerking Meeting ID: {m_id} ({title}) ---")
+            if clean_desc:
+                title = clean_desc
+            elif dmu_name:
+                title = dmu_name
+            else:
+                title = meeting.get('title') or "Vergadering"
+            
+            if is_debug_target:
+                logging.info(f"\n==================================================")
+                logging.info(f"--- Start verwerking Meeting ID: {m_id} ({title}) ---")
 
-            # DEBUG LOGGING VOOR TEST VERGADERINGEN
-            if m_id in ['1467', '1468']:
-                logging.info(f"DEBUG MEETING {m_id} JSON: {json.dumps(meeting)}")
+            meeting_ref = db.collection('vergaderingen').document(m_id)
+            meeting_snap = meeting_ref.get()
+            
+            # Haal bestaande data op om velden zoals 'item_media' te behouden
+            existing_m = meeting_snap.to_dict() if meeting_snap.exists else {}
+            existing_items_list = existing_m.get('items', [])
+            
+            # Maak een dictionary van de bestaande items op basis van ID voor makkelijk updaten
+            existing_items_dict = {i.get('id'): i for i in existing_items_list if 'id' in i}
 
-            # 1.1 Controleer en Schrijf Meeting weg naar Firestore
             new_meeting_data = {
                 'id': int(m_id),
                 'title': title,
@@ -114,159 +122,193 @@ def run_deep_sync():
                 'startTime': meeting.get('startTime', ''),
                 'confidential': bool(meeting.get('confidential', 0)),
                 'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
-                'location': meeting.get('location', '')
+                'location': meeting.get('location', ''),
+                'description': raw_desc,
+                'dmu': meeting.get('dmu', {})
             }
 
-            try:
-                doc_ref = db.collection('vergaderingen').document(m_id)
-                doc = doc_ref.get()
-                needs_update = True
-
-                # Controleer of we bestaande data hebben en vergelijk
-                if doc.exists:
-                    existing_data = doc.to_dict()
-                    if all(existing_data.get(k) == v for k, v in new_meeting_data.items()):
-                        needs_update = False
-                
-                if needs_update:
-                    new_meeting_data['last_sync'] = firestore.SERVER_TIMESTAMP
-                    doc_ref.set(new_meeting_data, merge=True, timeout=15)
-                    logging.info(f"Meeting {m_id} succesvol bijgewerkt in Firestore.")
-                else:
-                    logging.info(f"Meeting {m_id} is ongewijzigd. (Database overgeslagen)")
-            except Exception as e:
-                logging.error(f"Firestore fout bij wegschrijven meeting {m_id}: {e}")
-
-            # 1.2 Notificatie voor nieuwe meeting
-            if m_id not in notified_meetings:
-                send_push_notification(f"Nieuwe agenda: {title}", f"Datum: {m_date[:10]}")
-                notified_meetings.add(m_id)
-                new_meetings_found = True
-
-            # STAP 2: MEETING ITEMS OPHALEN PER MEETING
+            meeting_needs_update = False
+            
+            # STAP 2: ITEMS OPHALEN
             items_url = f"{DRONTEN_API_V2}/meetings/{m_id}/meetingitems"
+            updated_items_list = [] # Hier bouwen we de nieuwe geneste lijst in op
             
             try:
                 items_resp = requests.get(items_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
                 if items_resp.status_code == 200:
-                    raw_items_json = items_resp.json()
-
-                    # DEBUG LOGGING VOOR TEST VERGADERINGEN
-                    if m_id in ['1467', '1468']:
-                        logging.info(f"DEBUG ITEMS MEETING {m_id} JSON: {json.dumps(raw_items_json)}")
-
-                    items = extract_api_data(raw_items_json, endpoint_naam=items_url)
-                    logging.info(f"Aantal agendapunten gevonden voor meeting {m_id}: {len(items)}")
+                    items = extract_api_data(items_resp.json(), endpoint_naam=items_url)
                     
                     for item in items:
                         item_id = str(item.get('id'))
                         if not item_id or item_id == 'None':
                             continue
                         
-                        # 2.1 Controleer en Schrijf Agendapunt (Meeting Item)
+                        item_id_int = int(item_id)
                         item_title = item.get('title') or item.get('description') or f"Agendapunt {item_id}"
-                        new_item_data = {
-                            'id': int(item_id),
-                            'meeting_id': int(m_id),
-                            'title': item_title
-                        }
-
-                        try:
-                            item_ref = db.collection('agendapunten').document(item_id)
-                            item_doc = item_ref.get()
-                            needs_update = True
-
-                            if item_doc.exists:
-                                existing_item = item_doc.to_dict()
-                                if all(existing_item.get(k) == v for k, v in new_item_data.items()):
-                                    needs_update = False
-
-                            if needs_update:
-                                new_item_data['last_sync'] = firestore.SERVER_TIMESTAMP
-                                item_ref.set(new_item_data, merge=True, timeout=15)
-                                logging.info(f"   -> Agendapunt {item_id} weggeschreven naar Firestore.")
-                            else:
-                                logging.info(f"   -> Agendapunt {item_id} is ongewijzigd.")
-                        except Exception as e:
-                            logging.error(f"Firestore fout bij wegschrijven agendapunt {item_id}: {e}")
-
-                        # STAP 3: DOCUMENTEN OPHALEN PER MEETING ITEM
-                        docs_url = f"{DRONTEN_API_V2}/meetingitems/{item_id}/documents"
                         
+                        # Pak het bestaande item uit Firestore (als het bestaat) om velden te behouden
+                        nested_item_data = existing_items_dict.get(item_id_int, {})
+                        
+                        # Update met de verse data van de API
+                        nested_item_data['id'] = item_id_int
+                        nested_item_data['title'] = item_title
+                        nested_item_data['number'] = str(item.get('number', ''))
+                        nested_item_data['sortorder'] = item.get('sortOrder', 0)
+                        nested_item_data['description'] = item.get('description', '')
+                        
+                        # Zorg dat de velden die de app verwacht in ieder geval bestaan
+                        if 'item_media' not in nested_item_data: nested_item_data['item_media'] = []
+                        if 'portfolioHolder' not in nested_item_data: nested_item_data['portfolioHolder'] = ''
+                        if 'anchor' not in nested_item_data: nested_item_data['anchor'] = '#page'
+                        
+                        # We verzamelen documenten voor in de nested array
+                        nested_docs_list = []
+
+                        # STAP 3 & 4: DOCUMENTEN OPHALEN
+                        docs_url = f"{DRONTEN_API_V2}/meetingitems/{item_id}/documents"
                         try:
                             docs_resp = requests.get(docs_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
                             if docs_resp.status_code == 200:
-                                raw_docs_json = docs_resp.json()
-                                docs = extract_api_data(raw_docs_json, endpoint_naam=docs_url)
-                                
-                                if len(docs) > 0:
-                                    logging.info(f"     -> {len(docs)} document(en) gevonden voor agendapunt {item_id}.")
-                                else:
-                                    logging.info(f"     -> Geen documenten voor agendapunt {item_id}.")
+                                docs = extract_api_data(docs_resp.json(), endpoint_naam=docs_url)
                                 
                                 for doc in docs:
                                     doc_id = str(doc.get('id'))
                                     if not doc_id or doc_id == 'None':
                                         continue
                                         
-                                    doc_title = doc.get('fileName') or doc.get('description') or f"Stuk {doc_id}"
+                                    doc_detail_url = f"{DRONTEN_API_V2}/documents/{doc_id}"
+                                    doc_info = doc
+                                    try:
+                                        detail_resp = requests.get(doc_detail_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
+                                        if detail_resp.status_code == 200:
+                                            extracted_detail = extract_api_data(detail_resp.json(), endpoint_naam=doc_detail_url)
+                                            if isinstance(extracted_detail, dict):
+                                                doc_info = extracted_detail
+                                    except Exception:
+                                        pass
+
+                                    doc_title = doc_info.get('fileName') or doc_info.get('description') or f"Stuk {doc_id}"
                                     download_url = f"{DRONTEN_API_V2}/documents/{doc_id}/download"
                                     
-                                    # 4.1 Controleer en Schrijf Document
                                     new_doc_data = {
                                         'id': int(doc_id),
                                         'title': doc_title,
-                                        'meeting_id': int(m_id),
-                                        'item_id': int(item_id),
-                                        'confidential': bool(doc.get('confidential', 0)),
+                                        'confidential': bool(doc_info.get('confidential', 0)),
                                         'url': download_url
                                     }
+                                    if 'fileSize' in doc_info:
+                                        new_doc_data['fileSize'] = doc_info['fileSize']
+                                    if 'documentTypeLabel' in doc_info:
+                                        new_doc_data['documentType'] = doc_info['documentTypeLabel']
 
-                                    try:
-                                        doc_ref = db.collection('raadstukken').document(doc_id)
-                                        doc_snap = doc_ref.get()
-                                        needs_update = True
+                                    # Voeg toe aan de nested list voor deze meeting
+                                    nested_docs_list.append(new_doc_data)
 
-                                        if doc_snap.exists:
-                                            existing_doc = doc_snap.to_dict()
-                                            if all(existing_doc.get(k) == v for k, v in new_doc_data.items()):
-                                                needs_update = False
+                                    # SCHRIJF OOK WEG NAAR DE LOSSE 'raadstukken' COLLECTIE VOOR DE ZEKERHEID
+                                    flat_doc_data = new_doc_data.copy()
+                                    flat_doc_data['meeting_id'] = int(m_id)
+                                    flat_doc_data['item_id'] = item_id_int
+                                    
+                                    doc_ref = db.collection('raadstukken').document(doc_id)
+                                    doc_snap_flat = doc_ref.get()
+                                    
+                                    doc_needs_update = False
+                                    if not doc_snap_flat.exists:
+                                        doc_needs_update = True
+                                    else:
+                                        existing_d = doc_snap_flat.to_dict()
+                                        for k, v in flat_doc_data.items():
+                                            if existing_d.get(k) != v:
+                                                doc_needs_update = True
+                                                break
 
-                                        if needs_update:
-                                            new_doc_data['last_sync'] = firestore.SERVER_TIMESTAMP
-                                            doc_ref.set(new_doc_data, merge=True, timeout=15)
-                                            logging.info(f"       -> Document {doc_id} weggeschreven/bijgewerkt.")
-                                        # Als het document ongewijzigd is, printen we niets om een gigantische log te voorkomen!
-                                            
-                                    except Exception as e:
-                                        logging.error(f"Firestore fout bij wegschrijven document {doc_id}: {e}")
+                                    if doc_needs_update:
+                                        flat_doc_data['last_sync'] = firestore.SERVER_TIMESTAMP
+                                        doc_ref.set(flat_doc_data, merge=True, timeout=15)
+                                        if is_debug_target: logging.info(f"      -> DOC {doc_id} geüpdatet in Firestore.")
+                                        
+                                        if doc_id not in notified_docs:
+                                            send_push_notification("Nieuw raadsstuk gepubliceerd", doc_title)
+                                            notified_docs.add(doc_id)
+                                            new_docs_found = True
 
-                                    # 4.2 Notificatie voor nieuw document
-                                    if doc_id not in notified_docs and needs_update:
-                                        send_push_notification("Nieuw raadsstuk gepubliceerd", doc_title)
-                                        notified_docs.add(doc_id)
-                                        new_docs_found = True
-                            else:
-                                logging.error(f"API weigerde toegang tot docs voor item {item_id}: HTTP {docs_resp.status_code}")
                         except Exception as e:
-                             logging.error(f"Fout bij ophalen docs voor item {item_id}: {e}")
-                else:
-                    logging.error(f"API weigerde toegang tot items voor meeting {m_id}: HTTP {items_resp.status_code}")
+                             pass
+                        
+                        # Voeg de verzamelde documenten toe aan dit item
+                        nested_item_data['documents'] = nested_docs_list
+                        
+                        # Voeg dit complete item toe aan onze meeting items lijst
+                        updated_items_list.append(nested_item_data)
+
+                        # SCHRIJF OOK WEG NAAR DE LOSSE 'agendapunten' COLLECTIE
+                        flat_item_data = {
+                            'id': item_id_int,
+                            'meeting_id': int(m_id),
+                            'title': item_title
+                        }
+                        item_ref = db.collection('agendapunten').document(item_id)
+                        item_snap_flat = item_ref.get()
+                        item_needs_update = False
+                        
+                        if not item_snap_flat.exists:
+                            item_needs_update = True
+                        else:
+                            existing_i = item_snap_flat.to_dict()
+                            for k, v in flat_item_data.items():
+                                if existing_i.get(k) != v:
+                                    item_needs_update = True
+                                    break
+                                    
+                        if item_needs_update:
+                            flat_item_data['last_sync'] = firestore.SERVER_TIMESTAMP
+                            item_ref.set(flat_item_data, merge=True, timeout=15)
+
             except Exception as e:
-                logging.error(f"Fout bij ophalen items voor meeting {m_id}: {e}")
+                pass
+
+            # Voeg de volledig opgebouwde items-lijst (inclusief documenten) toe aan de meeting
+            new_meeting_data['items'] = updated_items_list
+
+            # NU PAS VERGELIJKEN WE DE COMPLETE MEETING MET WAT ER IN FIRESTORE STAAT
+            if not meeting_snap.exists:
+                meeting_needs_update = True
+            else:
+                # Vergelijk of de inhoud van new_meeting_data afwijkt van existing_m
+                for k, v in new_meeting_data.items():
+                    # We gebruiken een simpele string-vergelijking voor lijsten/dicts om verschillen snel te zien
+                    if str(existing_m.get(k)) != str(v):
+                        meeting_needs_update = True
+                        if is_debug_target:
+                            logging.info(f"MEETING {m_id} VERSCHIL in '{k}':")
+                            logging.info(f"  OUD: {str(existing_m.get(k))[:200]}...")
+                            logging.info(f"  NIEUW: {str(v)[:200]}...")
+                        break
+
+            if meeting_needs_update:
+                try:
+                    new_meeting_data['last_sync'] = firestore.SERVER_TIMESTAMP
+                    meeting_ref.set(new_meeting_data, merge=True, timeout=15)
+                    if is_debug_target: logging.info(f"-> MEETING {m_id} SUCCESVOL WEGGESCHREVEN MET COMPLETE NESTED STRUCTUUR!")
+                    
+                    if m_id not in notified_meetings:
+                        send_push_notification(f"Nieuwe agenda: {title}", f"Datum: {m_date[:10]}")
+                        notified_meetings.add(m_id)
+                        new_meetings_found = True
+                except Exception as e:
+                    logging.error(f"Fout bij opslaan meeting {m_id}: {e}")
+            else:
+                if is_debug_target: logging.info(f"MEETING {m_id} is ongewijzigd.")
 
     except Exception as e:
         logging.error(f"Fout in run_deep_sync: {e}")
 
-    # Caches opslaan indien gewijzigd
     if new_meetings_found:
         save_cache(NOTIFIED_MEETINGS_FILE, notified_meetings)
-        logging.info("Meeting cache bijgewerkt.")
     if new_docs_found:
         save_cache(NOTIFIED_DOCS_FILE, notified_docs)
-        logging.info("Document cache bijgewerkt.")
 
 if __name__ == "__main__":
-    logging.info("--- Start Sync Orchestrator ---")
+    logging.info("--- Start Sync Orchestrator (NESTED MODE) ---")
     run_deep_sync()
     logging.info("--- Eind Sync Orchestrator ---")
