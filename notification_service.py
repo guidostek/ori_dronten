@@ -33,7 +33,7 @@ def send_push_notification(title, body):
     )
     
     try:
-        response = messaging.send_multicast(message)
+        response = messaging.send_each_for_multicast(message)
         logging.info(f"FCM verzonden: {response.success_count} succesvol, {response.failure_count} mislukt.")
     except Exception as e:
         logging.error(f"Fatale fout bij verzenden van pushbericht: {e}")
