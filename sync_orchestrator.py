@@ -11,7 +11,7 @@ from notification_service import send_push_notification
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, # INFO laat nu veel meer zien door onze aanpassingen
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(os.path.join(LOG_DIR, "sync_orchestrator.log")),
@@ -41,16 +41,14 @@ def get_sync_start_date_str():
 
 def extract_data(response_json, fallback_key=None):
     """
-    Extraheert veilig de data array uit de API v2 response.
-    Bevat een robuuste fallback en foutdetectie voor wisselende API-responses.
+    Extraheert veilig de data array uit de API v2 response met uitgebreide logging.
     """
     if 'result' not in response_json:
-        logging.error(f"ONBEKENDE STRUCTUUR: De verwachte root-node 'result' ontbreekt in de API-response. Response: {response_json}")
+        logging.error(f"ONBEKENDE STRUCTUUR: Root-node 'result' ontbreekt. Response keys: {list(response_json.keys())}")
         return []
 
     result = response_json['result']
 
-    # Controleer of 'result' een dictionary is
     if isinstance(result, dict):
         if 'model' in result:
             return result['model']
@@ -59,16 +57,14 @@ def extract_data(response_json, fallback_key=None):
         elif fallback_key and fallback_key in result:
             return result[fallback_key]
         else:
-            logging.error(f"ONBEKENDE STRUCTUUR: 'result' is een object, maar bevat geen bekende data-nodes. Gevonden sleutels: {list(result.keys())}")
+            logging.error(f"ONBEKENDE STRUCTUUR: 'result' dict bevat geen bekende data-nodes. Gevonden sleutels: {list(result.keys())}")
             return []
             
-    # Fallback: Controleer of 'result' direct de lijst met items is
     elif isinstance(result, list):
         return result
         
-    # Als het een onbekend datatype is
     else:
-        logging.error(f"ONBEKENDE STRUCTUUR: 'result' heeft een onverwacht datatype ({type(result)}). Kan niet parsen.")
+        logging.error(f"ONBEKENDE STRUCTUUR: 'result' heeft datatype ({type(result)}). Kan niet parsen.")
         return []
 
 def run_deep_sync():
@@ -83,15 +79,17 @@ def run_deep_sync():
     new_docs_found = False
 
     # STAP 1: MEETINGS OPHALEN
-    meetings_url = f"{DRONTEN_API_V2}/meetings?date_from={date_from_str}&sort=date_desc&limit={LIMIT_MEETINGS}"
+    meetings_url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&limit=50"
+    logging.info(f"Aanroepen API voor meetings: {meetings_url}")
     
     try:
         resp = requests.get(meetings_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
         if resp.status_code != 200:
-            logging.error(f"API weigerde toegang tot meetings: {resp.status_code}")
+            logging.error(f"API weigerde toegang tot meetings: HTTP {resp.status_code}")
             return
 
         meetings = extract_data(resp.json(), 'meetings')
+        logging.info(f"Totaal aantal meetings gevonden in API: {len(meetings)}")
 
         for meeting in meetings:
             m_id = str(meeting.get('id'))
@@ -100,18 +98,24 @@ def run_deep_sync():
                 
             m_date = meeting.get('date', '')
             title = meeting.get('title') or "Vergadering"
+            
+            logging.info(f"--- Start verwerking Meeting ID: {m_id} ({title}) ---")
 
             # 1.1 Schrijf Meeting weg naar Firestore
-            db.collection('vergaderingen').document(m_id).set({
-                'id': int(m_id),
-                'title': title,
-                'date': m_date,
-                'startTime': meeting.get('startTime', ''),
-                'confidential': bool(meeting.get('confidential', 0)),
-                'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
-                'location': meeting.get('location', ''), 
-                'last_sync': firestore.SERVER_TIMESTAMP
-            }, merge=True, timeout=15)
+            try:
+                db.collection('vergaderingen').document(m_id).set({
+                    'id': int(m_id),
+                    'title': title,
+                    'date': m_date,
+                    'startTime': meeting.get('startTime', ''),
+                    'confidential': bool(meeting.get('confidential', 0)),
+                    'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
+                    'location': meeting.get('location', ''), 
+                    'last_sync': firestore.SERVER_TIMESTAMP
+                }, merge=True, timeout=15)
+                logging.info(f"Meeting {m_id} succesvol bijgewerkt in Firestore.")
+            except Exception as e:
+                logging.error(f"Firestore fout bij wegschrijven meeting {m_id}: {e}")
 
             # 1.2 Notificatie voor nieuwe meeting
             if m_id not in notified_meetings:
@@ -121,11 +125,13 @@ def run_deep_sync():
 
             # STAP 2: MEETING ITEMS OPHALEN PER MEETING
             items_url = f"{DRONTEN_API_V2}/meetings/{m_id}/meetingitems"
+            logging.info(f"Aanroepen API voor agendapunten van meeting {m_id}: {items_url}")
             
             try:
                 items_resp = requests.get(items_url, headers={'User-Agent': 'DrontenRaadApp-Monitor/2.0'}, timeout=TIMEOUT_SECONDS)
                 if items_resp.status_code == 200:
                     items = extract_data(items_resp.json(), 'items')
+                    logging.info(f"Aantal agendapunten gevonden voor meeting {m_id}: {len(items)}")
                     
                     for item in items:
                         item_id = str(item.get('id'))
@@ -133,14 +139,17 @@ def run_deep_sync():
                             continue
                         
                         # 2.1 Schrijf Agendapunt (Meeting Item) weg naar Firestore
-                        # Zo zorgen we dat ook agendapunten zónder documenten worden opgeslagen!
                         item_title = item.get('title') or item.get('description') or f"Agendapunt {item_id}"
-                        db.collection('agendapunten').document(item_id).set({
-                            'id': int(item_id),
-                            'meeting_id': int(m_id),
-                            'title': item_title,
-                            'last_sync': firestore.SERVER_TIMESTAMP
-                        }, merge=True, timeout=15)
+                        try:
+                            db.collection('agendapunten').document(item_id).set({
+                                'id': int(item_id),
+                                'meeting_id': int(m_id),
+                                'title': item_title,
+                                'last_sync': firestore.SERVER_TIMESTAMP
+                            }, merge=True, timeout=15)
+                            logging.info(f"  -> Agendapunt {item_id} weggeschreven naar Firestore.")
+                        except Exception as e:
+                            logging.error(f"Firestore fout bij wegschrijven agendapunt {item_id}: {e}")
 
                         # STAP 3: DOCUMENTEN OPHALEN PER MEETING ITEM
                         docs_url = f"{DRONTEN_API_V2}/meetingitems/{item_id}/documents"
@@ -150,34 +159,44 @@ def run_deep_sync():
                             if docs_resp.status_code == 200:
                                 docs = extract_data(docs_resp.json(), 'documents')
                                 
+                                if len(docs) > 0:
+                                    logging.info(f"    -> {len(docs)} document(en) gevonden voor agendapunt {item_id}.")
+                                else:
+                                    logging.info(f"    -> Geen documenten voor agendapunt {item_id}.")
+                                
                                 for doc in docs:
                                     doc_id = str(doc.get('id'))
                                     if not doc_id or doc_id == 'None':
                                         continue
                                         
                                     doc_title = doc.get('fileName') or doc.get('description') or f"Stuk {doc_id}"
-                                    
-                                    # STAP 4: DOWNLOAD URL GENEREREN
                                     download_url = f"{DRONTEN_API_V2}/documents/{doc_id}/download"
                                     
                                     # 4.1 Schrijf Document weg naar Firestore
-                                    db.collection('raadstukken').document(doc_id).set({
-                                        'id': int(doc_id),
-                                        'title': doc_title,
-                                        'meeting_id': int(m_id),
-                                        'item_id': int(item_id),
-                                        'confidential': bool(doc.get('confidential', 0)),
-                                        'url': download_url,
-                                        'last_sync': firestore.SERVER_TIMESTAMP
-                                    }, merge=True, timeout=15)
+                                    try:
+                                        db.collection('raadstukken').document(doc_id).set({
+                                            'id': int(doc_id),
+                                            'title': doc_title,
+                                            'meeting_id': int(m_id),
+                                            'item_id': int(item_id),
+                                            'confidential': bool(doc.get('confidential', 0)),
+                                            'url': download_url,
+                                            'last_sync': firestore.SERVER_TIMESTAMP
+                                        }, merge=True, timeout=15)
+                                    except Exception as e:
+                                        logging.error(f"Firestore fout bij wegschrijven document {doc_id}: {e}")
 
                                     # 4.2 Notificatie voor nieuw document
                                     if doc_id not in notified_docs:
                                         send_push_notification("Nieuw raadsstuk gepubliceerd", doc_title)
                                         notified_docs.add(doc_id)
                                         new_docs_found = True
+                            else:
+                                logging.error(f"API weigerde toegang tot docs voor item {item_id}: HTTP {docs_resp.status_code}")
                         except Exception as e:
                              logging.error(f"Fout bij ophalen docs voor item {item_id}: {e}")
+                else:
+                    logging.error(f"API weigerde toegang tot items voor meeting {m_id}: HTTP {items_resp.status_code}")
             except Exception as e:
                 logging.error(f"Fout bij ophalen items voor meeting {m_id}: {e}")
 
