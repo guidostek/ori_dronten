@@ -13,7 +13,7 @@ from firebase_client import db
 from notification_service import send_push_notification
 
 # --- CONFIGURATIE FALLBACKS ---
-DOC_DETAIL_DELAY = globals().get('DOC_DETAIL_DELAY', 0.0) 
+DOC_DETAIL_DELAY = globals().get('DOC_DETAIL_DELAY', 0.1) 
 BATCH_LIMIT = globals().get('BATCH_LIMIT', 400)
 
 # --- LOGGING SETUP ---
@@ -62,12 +62,12 @@ def extract_api_data(response_json, endpoint_naam="API"):
         return []
     return result if isinstance(result, list) else []
 
-# --- NIEUW: HERSTELDE MEDIA SCRAPER ---
+# --- MEDIA SCRAPER (Met link-tekst extractie) ---
 
 def extract_media_enriched(relative_url, session, items_lijst):
     """
-    Scrapet de publieke vergaderpagina voor volledige media en agendapunt-fragmenten.
-    Identificeert de full_audio_url voor de player bovenin.
+    Scrapet de publieke vergaderpagina voor volledige media en fragmenten.
+    Gebruikt de tekst van de link op de pagina voor duidelijke titels.
     """
     if not relative_url:
         return [], items_lijst, None
@@ -94,12 +94,12 @@ def extract_media_enriched(relative_url, session, items_lijst):
 
             if not any(m['url'] == url for m in meeting_media):
                 meeting_media.append({
-                    'title': a.get_text(strip=True) or "Opname",
+                    'title': a.get_text(strip=True) or "Volledige opname",
                     'url': url,
                     'type': m_type
                 })
 
-        # Zoek naar video iframes (YouTube/Notubiz)
+        # Zoek naar video iframes
         for iframe in soup.find_all('iframe'):
             src = iframe.get('src')
             if src and any(p in src for p in ['notubiz', 'youtube', 'vimeo', 'raadsinformatie']):
@@ -124,15 +124,20 @@ def extract_media_enriched(relative_url, session, items_lijst):
                     href = link.get('href')
                     if any(ext in href.lower() for ext in ['.mp3', '.mp4', '#t=', 'start=']):
                         l_url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
+                        
+                        # Gebruik de tekst van de link voor een betere titel
+                        link_label = link.get_text(strip=True)
+                        display_title = f"{title}: {link_label}" if link_label else f"Fragment: {title}"
+                        
                         item_media.append({
-                            'title': f"Fragment: {title}",
+                            'title': display_title,
                             'url': l_url,
                             'type': 'audio' if '.mp3' in l_url.lower() else 'video'
                         })
             item['item_media'] = item_media
 
     except Exception as e:
-        logging.warning(f"[-] Fout bij media scraping voor {full_url}: {e}")
+        logging.warning(f"[-] Scraper fout bij {full_url}: {e}")
         
     return meeting_media, items_lijst, full_audio_url
 
@@ -140,7 +145,7 @@ def extract_media_enriched(relative_url, session, items_lijst):
 
 def run_deep_sync():
     date_from_str = get_sync_start_date_str()
-    logging.info(f"Start Deep Sync (SCHEMA V2 + MEDIA RECOVERY) vanaf datum: {date_from_str}")
+    logging.info(f"Start Deep Sync (SCHEMA V2) vanaf datum: {date_from_str}")
 
     notified_meetings = load_cache(NOTIFIED_MEETINGS_FILE)
     notified_docs = load_cache(NOTIFIED_DOCS_FILE)
@@ -153,6 +158,7 @@ def run_deep_sync():
 
     batch = db.batch()
     batch_count = 0
+    
     processed_meeting_ids = set()
     api_item_ids = set()
     api_doc_ids = set()
@@ -165,9 +171,13 @@ def run_deep_sync():
             batch_count = 0
 
     try:
+        # --- DEEL 1: VERGADERINNGEN & AGENDAPUNTEN ---
         meetings_url = f"{DRONTEN_API_V2}/meetings?sort=id_desc&limit=50"
         resp = session.get(meetings_url, timeout=TIMEOUT_SECONDS)
-        if resp.status_code != 200: return
+        if resp.status_code != 200:
+            logging.error(f"Fout bij ophalen meetings: {resp.status_code}")
+            return
+            
         meetings = extract_api_data(resp.json(), endpoint_naam=meetings_url)
 
         for meeting in meetings:
@@ -175,8 +185,9 @@ def run_deep_sync():
             if not m_id or m_id == 'None': continue
             
             processed_meeting_ids.add(int(m_id))
-            is_debug_target = (m_id in ['1467', '1468'])
             m_date = meeting.get('date', '')
+            
+            # Sla oude vergaderingen over
             if m_date < date_from_str: continue
 
             meeting_ref = db.collection('vergaderingen').document(m_id)
@@ -188,6 +199,7 @@ def run_deep_sync():
             updated_items_list = []
             items_url = f"{DRONTEN_API_V2}/meetings/{m_id}/meetingitems"
             items_resp = session.get(items_url, timeout=TIMEOUT_SECONDS)
+            
             if items_resp.status_code == 200:
                 items = extract_api_data(items_resp.json(), endpoint_naam=items_url)
                 for item in items:
@@ -197,23 +209,27 @@ def run_deep_sync():
                     
                     item_title = item.get('title') or item.get('description') or f"Punt {item_id}"
                     
-                    # Haal documenten per item op (met detail fetch)
+                    # Documenten per item
                     nested_docs_list = []
                     docs_url = f"{DRONTEN_API_V2}/meetingitems/{item_id}/documents"
                     docs_resp = session.get(docs_url, timeout=TIMEOUT_SECONDS)
+                    
                     if docs_resp.status_code == 200:
                         docs = extract_api_data(docs_resp.json())
                         for doc in docs:
                             d_id = str(doc['id'])
                             api_doc_ids.add(int(d_id))
                             
-                            # Detail fetch voor extra metadata
+                            # DETAIL FETCH: Haal volledige metadata van het document op
                             doc_info = doc
-                            if DOC_DETAIL_DELAY > 0: time.sleep(DOC_DETAIL_DELAY)
+                            if DOC_DETAIL_DELAY > 0:
+                                time.sleep(DOC_DETAIL_DELAY)
                             try:
                                 d_detail = session.get(f"{DRONTEN_API_V2}/documents/{d_id}", timeout=TIMEOUT_SECONDS)
-                                if d_detail.status_code == 200: doc_info = extract_api_data(d_detail.json())
-                            except: pass
+                                if d_detail.status_code == 200:
+                                    doc_info = extract_api_data(d_detail.json())
+                            except:
+                                pass
 
                             doc_data = {
                                 'id': int(d_id),
@@ -225,24 +241,33 @@ def run_deep_sync():
                             }
                             nested_docs_list.append(doc_data)
                             
-                            # Schrijf naar platte collectie
-                            batch.set(db.collection('raadstukken').document(d_id), {**doc_data, 'last_sync': firestore.SERVER_TIMESTAMP}, merge=True)
+                            # Schrijf naar raadstukken collectie
+                            batch.set(db.collection('raadstukken').document(d_id), {
+                                **doc_data, 
+                                'last_sync': firestore.SERVER_TIMESTAMP
+                            }, merge=True)
                             batch_count += 1
                             commit_batch_if_needed()
 
-                    # Schrijf agendapunt naar platte collectie
+                    # Platte agendapunten collectie voor zoekopdrachten
                     batch.set(db.collection('agendapunten').document(item_id), {
-                        'id': item_id_int, 'meeting_id': int(m_id), 'title': item_title, 'last_sync': firestore.SERVER_TIMESTAMP
+                        'id': item_id_int,
+                        'meeting_id': int(m_id),
+                        'title': item_title,
+                        'last_sync': firestore.SERVER_TIMESTAMP
                     }, merge=True)
                     batch_count += 1
 
                     updated_items_list.append({
-                        'id': item_id_int, 'title': item_title, 'number': str(item.get('number', '')),
-                        'sortorder': item.get('sortOrder', 0), 'description': item.get('description', ''),
+                        'id': item_id_int,
+                        'title': item_title,
+                        'number': str(item.get('number', '')),
+                        'sortorder': item.get('sortOrder', 0),
+                        'description': item.get('description', ''),
                         'documents': nested_docs_list
                     })
 
-            # --- MEDIA SCRAPER INTEGRATIE ---
+            # --- MEDIA SCRAPER ---
             m_media, enriched_items, full_audio = extract_media_enriched(meeting.get('url'), session, updated_items_list)
 
             new_meeting_data = {
@@ -251,7 +276,7 @@ def run_deep_sync():
                 'title': clean_html(meeting.get('description', '')) or meeting.get('title') or "Vergadering",
                 'date': m_date,
                 'confidential': bool(meeting.get('confidential', 0)),
-                'full_audio_url': full_audio, # <--- De ontbrekende MP3 link
+                'full_audio_url': full_audio,
                 'url_public': f"{BASE_URL_PUBLIC}{meeting.get('url')}" if meeting.get('url') else "",
                 'location': meeting.get('location', ''),
                 'items': enriched_items,
@@ -259,45 +284,50 @@ def run_deep_sync():
                 'last_sync': firestore.SERVER_TIMESTAMP
             }
 
+            # Uitgebreide vergelijking om updates te bepalen
             meeting_needs_update = not meeting_snap.exists
             if not meeting_needs_update:
                 for k, v in new_meeting_data.items():
                     if str(existing_m.get(k)) != str(v):
                         meeting_needs_update = True
-                        if is_debug_target: logging.info(f"MEETING {m_id} verschilt in {k}")
                         break
 
             if meeting_needs_update:
                 batch.set(meeting_ref, new_meeting_data, merge=True)
                 batch_count += 1
                 commit_batch_if_needed()
+                
                 if m_id not in notified_meetings:
-                    send_push_notification(f"Nieuwe agenda: {new_meeting_data['title']}", f"Datum: {m_date[:10]}", doc_id=m_id)
+                    # FIX: Geen doc_id argument meer om crash te voorkomen
+                    send_push_notification(f"Nieuwe agenda: {new_meeting_data['title']}", f"Datum: {m_date[:10]}")
                     notified_meetings.add(m_id)
                     new_meetings_found = True
 
         # --- DEEL 2: GLOBALE RAADSTUKKEN SYNC ---
-        g_resp = session.get(f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50", timeout=TIMEOUT_SECONDS)
-        if g_resp.status_code == 200:
-            for d in extract_api_data(g_resp.json()):
+        docs_url = f"{DRONTEN_API_V2}/documents?sort=id_desc&limit=50"
+        d_resp = session.get(docs_url, timeout=TIMEOUT_SECONDS)
+        if d_resp.status_code == 200:
+            for d in extract_api_data(d_resp.json()):
                 d_id = str(d['id'])
                 if d_id not in notified_docs:
                     title = d.get('description') or d.get('fileName') or f"Stuk {d_id}"
                     db.collection('raadstukken').document(d_id).set({
-                        'id': int(d_id), 'schema_version': 2, 'title': title, 
-                        'url': f"{DRONTEN_API_V2}/documents/{d_id}/download", 'last_sync': firestore.SERVER_TIMESTAMP
+                        'id': int(d_id),
+                        'schema_version': 2,
+                        'title': title,
+                        'url': f"{DRONTEN_API_V2}/documents/{d_id}/download",
+                        'last_sync': firestore.SERVER_TIMESTAMP
                     }, merge=True)
-                    send_push_notification("Nieuw raadstuk gepubliceerd", title, doc_id=d_id)
+                    send_push_notification("Nieuw raadstuk gepubliceerd", title)
                     notified_docs.add(d_id)
                     new_docs_found = True
 
-        # --- DEEL 3: CLEANUP ---
+        # --- DEEL 3: CLEANUP VAN VERWIJDERDE DATA ---
         if processed_meeting_ids:
             for mid in processed_meeting_ids:
-                # Verwijder verouderde items uit platte collecties
                 for col, valid_ids in [('agendapunten', api_item_ids), ('raadstukken', api_doc_ids)]:
-                    q = db.collection(col).where('meeting_id', '==', mid).stream()
-                    for doc in q:
+                    query = db.collection(col).where('meeting_id', '==', mid).stream()
+                    for doc in query:
                         if int(doc.id) not in valid_ids:
                             batch.delete(doc.reference)
                             batch_count += 1
@@ -306,10 +336,12 @@ def run_deep_sync():
         commit_batch_if_needed(force=True)
 
     except Exception as e:
-        logging.error(f"Fout in sync: {e}")
+        logging.error(f"Fout in run_deep_sync: {e}")
 
-    if new_meetings_found: save_cache(NOTIFIED_MEETINGS_FILE, notified_meetings)
-    if new_docs_found: save_cache(NOTIFIED_DOCS_FILE, notified_docs)
+    if new_meetings_found:
+        save_cache(NOTIFIED_MEETINGS_FILE, notified_meetings)
+    if new_docs_found:
+        save_cache(NOTIFIED_DOCS_FILE, notified_docs)
 
 if __name__ == "__main__":
     run_deep_sync()
