@@ -124,12 +124,17 @@ def extract_media_enriched(relative_url, session, items_lijst):
                         if any(ext in href.lower() for ext in ['.mp3', '.mp4', '#t=', 'start=']):
                             l_url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
                             
-                            # CHIRURGISCH: Gebruik de tekst van de link (bijv. de naam van de spreker)
-                            link_label = link.get_text(strip=True)
-                            
-                            # Als er een label is (zoals 'J.N. Ammerlaan'), gebruik die direct.
-                            # We plakken het agendapunt er niet meer voor om de lijst schoon te houden.
-                            display_title = link_label if link_label else f"Fragment: {title}"
+                            # Dit blok vervangt de titel-extractie logica
+                            raw_label = link.get_text(strip=True)
+                            clean_label = raw_label
+
+                            # Woorden die we niet in de titel willen hebben
+                            noise_words = ["Video", "Download", "fragment", "Bekijk", "verslag", "Directe", "link"]
+                            for word in noise_words:
+                                clean_label = re.sub(word, '', clean_label, flags=re.IGNORECASE).strip()
+
+                            # Gebruik de schone naam, of een fallback als er niets overblijft
+                            display_title = clean_label if len(clean_label) > 2 else f"Video: {title}"
                             
                             item_media.append({
                                 'title': display_title,
