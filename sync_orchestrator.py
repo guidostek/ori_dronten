@@ -39,12 +39,37 @@ def get_sync_start_date_str():
     start_date = datetime.now(timezone.utc) - timedelta(days=DEEP_SYNC_DAYS)
     return start_date.strftime('%Y-%m-%d')
 
-def extract_data(response_json, fallback_key):
-    """Extraheert veilig de data array uit de API v2 response."""
-    result = response_json.get('result', {})
-    if 'model' in result:
-        return result['model']
-    return result.get(fallback_key, [])
+def extract_data(response_json, fallback_key=None):
+    """
+    Extraheert veilig de data array uit de API v2 response.
+    Bevat een robuuste fallback en foutdetectie voor wisselende API-responses.
+    """
+    if 'result' not in response_json:
+        logging.error(f"ONBEKENDE STRUCTUUR: De verwachte root-node 'result' ontbreekt in de API-response. Response: {response_json}")
+        return []
+
+    result = response_json['result']
+
+    # Controleer of 'result' een dictionary is
+    if isinstance(result, dict):
+        if 'model' in result:
+            return result['model']
+        elif 'meetingitems' in result:
+            return result['meetingitems']
+        elif fallback_key and fallback_key in result:
+            return result[fallback_key]
+        else:
+            logging.error(f"ONBEKENDE STRUCTUUR: 'result' is een object, maar bevat geen bekende data-nodes. Gevonden sleutels: {list(result.keys())}")
+            return []
+            
+    # Fallback: Controleer of 'result' direct de lijst met items is
+    elif isinstance(result, list):
+        return result
+        
+    # Als het een onbekend datatype is
+    else:
+        logging.error(f"ONBEKENDE STRUCTUUR: 'result' heeft een onverwacht datatype ({type(result)}). Kan niet parsen.")
+        return []
 
 def run_deep_sync():
     """Voert de exacte trapsgewijze deep sync uit volgens de API V2 documentatie."""
@@ -58,7 +83,6 @@ def run_deep_sync():
     new_docs_found = False
 
     # STAP 1: MEETINGS OPHALEN
-    # We gebruiken de date_from parameter uit de API documentatie om efficiënt 3 maanden op te halen
     meetings_url = f"{DRONTEN_API_V2}/meetings?date_from={date_from_str}&sort=date_desc&limit={LIMIT_MEETINGS}"
     
     try:
@@ -108,6 +132,16 @@ def run_deep_sync():
                         if not item_id or item_id == 'None':
                             continue
                         
+                        # 2.1 Schrijf Agendapunt (Meeting Item) weg naar Firestore
+                        # Zo zorgen we dat ook agendapunten zónder documenten worden opgeslagen!
+                        item_title = item.get('title') or item.get('description') or f"Agendapunt {item_id}"
+                        db.collection('agendapunten').document(item_id).set({
+                            'id': int(item_id),
+                            'meeting_id': int(m_id),
+                            'title': item_title,
+                            'last_sync': firestore.SERVER_TIMESTAMP
+                        }, merge=True, timeout=15)
+
                         # STAP 3: DOCUMENTEN OPHALEN PER MEETING ITEM
                         docs_url = f"{DRONTEN_API_V2}/meetingitems/{item_id}/documents"
                         
