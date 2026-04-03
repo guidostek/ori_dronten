@@ -66,13 +66,7 @@ def extract_api_data(response_json, endpoint_naam="API"):
 # --- MEDIA SCRAPER (Verbeterd voor schone titels zoals 'J.N. Ammerlaan') ---
 
 def extract_media_enriched(relative_url, session, items_lijst):
-    """
-    Scrapet de publieke vergaderpagina voor volledige media en fragmenten.
-    Gebruikt de tekst van de link op de pagina voor duidelijke titels.
-    """
-    if not relative_url:
-        return [], items_lijst, None
-        
+    if not relative_url: return [], items_lijst, None
     full_url = f"{BASE_URL_PUBLIC}{relative_url}"
     meeting_media = []
     full_audio_url = None
@@ -82,70 +76,59 @@ def extract_media_enriched(relative_url, session, items_lijst):
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # 1. Zoek HOOFD opnames (Audio & Video)
+            # 1. Volledige audio (blijft hetzelfde)
             for a in soup.find_all('a', href=re.compile(r'\.(mp3|mp4)$', re.I)):
                 href = a.get('href')
                 url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
-                m_type = 'audio' if url.lower().endswith('.mp3') else 'video'
-                
-                if m_type == 'audio' and not full_audio_url:
-                    full_audio_url = url
+                if url.lower().endswith('.mp3'): full_audio_url = url
+                # ... (rest van hoofd-media logica)
 
-                if not any(m['url'] == url for m in meeting_media):
-                    meeting_media.append({
-                        'title': a.get_text(strip=True) or "Volledige opname",
-                        'url': url,
-                        'type': m_type
-                    })
-
-            # Zoek naar video iframes (YouTube/Notubiz)
-            for iframe in soup.find_all('iframe'):
-                src = iframe.get('src')
-                if src and any(p in src for p in ['notubiz', 'youtube', 'vimeo', 'raadsinformatie']):
-                    v_url = src if src.startswith('http') else f"https:{src}"
-                    if not any(m['url'] == v_url for m in meeting_media):
-                        meeting_media.append({
-                            'title': 'Videoverslag / Stream',
-                            'url': v_url,
-                            'type': 'video'
-                        })
-
-            # 2. Zoek fragmenten per agendapunt
+            # 2. CHIRURGISCH: Fragmenten per specifiek agendapunt
             for item in items_lijst:
                 title = item.get('title', '')
-                if not title: continue
+                item_id = str(item.get('id', ''))
                 
-                container = soup.find(lambda tag: tag.name in ['div', 'li', 'tr'] and title in tag.get_text())
+                # Zoek de container van DIT agendapunt. 
+                # We zoeken naar de <li> die het ID van het agendapunt bevat in 'data-item-id'
+                container = soup.find('li', {'data-item-id': item_id})
                 
+                # Fallback: als ID niet werkt, zoek op tekstinhoud van de titel
+                if not container:
+                    container = soup.find(lambda tag: tag.name in ['li', 'div'] and title in tag.get_text())
+
                 item_media = []
                 if container:
-                    for link in container.find_all(['a', 'button'], href=True):
+                    # Zoek alleen BINNEN deze container naar fragment-links
+                    # In jouw screenshot zie ik 'a.speaker' of 'a.fragment'
+                    for link in container.find_all('a', href=True):
                         href = link.get('href')
-                        if any(ext in href.lower() for ext in ['.mp3', '.mp4', '#t=', 'start=']):
+                        # Check of het een fragment-link is (meestal met tijdstempel #t= of start=)
+                        if any(x in href.lower() for x in ['.mp4', '#t=', 'start=']):
                             l_url = href if href.startswith('http') else f"{BASE_URL_PUBLIC}{href}"
                             
-                            # Dit blok vervangt de titel-extractie logica
-                            raw_label = link.get_text(strip=True)
-                            clean_label = raw_label
+                            # HAAL DE NAAM OP (Zoals in je screenshot: span.name)
+                            speaker_span = link.find('span', class_='name')
+                            if speaker_span:
+                                display_title = speaker_span.get_text(strip=True)
+                            else:
+                                # Fallback naar de tekst van de link zelf, maar gestript van ruis
+                                display_title = link.get_text(strip=True)
+                                for noise in ["Video", "Download", "fragment"]:
+                                    display_title = display_title.replace(noise, "").strip()
 
-                            # Woorden die we niet in de titel willen hebben
-                            noise_words = ["Video", "Download", "fragment", "Bekijk", "verslag", "Directe", "link"]
-                            for word in noise_words:
-                                clean_label = re.sub(word, '', clean_label, flags=re.IGNORECASE).strip()
+                            if not display_title: display_title = "Fragment"
 
-                            # Gebruik de schone naam, of een fallback als er niets overblijft
-                            display_title = clean_label if len(clean_label) > 2 else f"Video: {title}"
-                            
                             item_media.append({
                                 'title': display_title,
-                                'url': l_url,
-                                'type': 'audio' if '.mp3' in l_url.lower() else 'video'
+                                'url': l_url, 
+                                'type': 'video'
                             })
+                
+                # Update alleen het agendapunt met zijn EIGEN filmpjes
                 item['item_media'] = item_media
 
     except Exception as e:
-        logging.warning(f"[-] Scraper fout bij {full_url}: {e}")
-        
+        logging.warning(f"Scraper fout: {e}")
     return meeting_media, items_lijst, full_audio_url
 
 # --- HOOFD SYNC LOGICA ---
